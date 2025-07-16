@@ -1490,7 +1490,7 @@ if __name__ == "__main__":
 
     if stream_source not in stream_sources:
         sources_str = " ".join(str(x) for x in stream_sources)
-        logging.error("Invalid source, aborting..")
+        logging.error("Invalid source: {}, aborting..".format(stream_source))
         logging.info("Possible choices are: " + sources_str)
         #sys.exit(1)
 
