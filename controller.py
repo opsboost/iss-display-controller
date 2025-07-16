@@ -1299,7 +1299,7 @@ if __name__ == "__main__":
                         type=str,
                         action='append',
                         required=True)
-    parser.add_argument('--stream_source',
+    parser.add_argument('--stream-source',
                         dest='stream_source',
                         env_var='STREAM_SOURCE',
                         help="The source of the stream",
