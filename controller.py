@@ -98,17 +98,32 @@ def which(cmd):
     return None
 
 
-def download_file(url, path):
+def download_file(url, path, use_curl=True):
     logging.info("Downloading: " + url)
-    cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
 
-    Popen(cmd,
-          env=env,
-          start_new_session=True,
-          close_fds=True,
-          encoding='utf8')
+    if not use_curl:
+        # Use requests to download
+        response = requests.get(url)
+
+        with open(path, "wb") as file:
+           file.write(response.content)
+
+    else:
+        cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
 
     return True
+
+
+def reexec_self():
+    logging.info("Restarting after update..")
+    # Re-execute the current script
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def skip_comments(file):
@@ -1388,6 +1403,18 @@ if __name__ == "__main__":
                         help="The theme to use",
                         type=str,
                         default="default")
+    parser.add_argument('--update-controller',
+                        dest='update_controller',
+                        env_var='UPDATE_CONTROLLER',
+                        help="Fetch latest controller.py on startup",
+                        type=bool,
+                        default=False)
+    parser.add_argument('--controller-update-url',
+                        dest='controller_update_url',
+                        env_var='CONTROLLER_UPDATE_URL',
+                        help="The URL to controller.py to update with",
+                        type=str,
+                        default="https://github.com/opsboost/iss-display-controller/blob/dev/controller.py")
     parser.add_argument('--zeroconf-publish-service',
                         dest='zeroconf_publish_service',
                         env_var='ZEROCONF_PUBLISH',
@@ -1432,6 +1459,8 @@ if __name__ == "__main__":
     mqtt_topics = args.mqtt_topics
     probe_ip = args.probe_ip
     theme_name = args.theme_name
+    update_controller = args.update_controller
+    controller_update_url = args.controller_update_url
     zeroconf_publish_service = args.zeroconf_publish_service
     zc_service_name_prefix = args.zeroconf_service_name_prefix
     zc_service_type = args.zeroconf_service_type
@@ -1501,6 +1530,15 @@ if __name__ == "__main__":
     if not local_ip:
         local_ip = System.net_iface_address(probe_ip)
 
+    path_update = "/tmp/controller-updated"
+    if update_controller and not os.path.exists(path_update):
+        logging.info("Updating self..")
+        #download_file(controller_update_url, os.path.abspath(__file__), False)
+        download_file(controller_update_url, os.path.abspath("/tmp/" + os.path.basename(__file__)), False)
+        with open(path_update, "w") as file:
+            file.write("Update done\n")
+        reexec_self()
+
     display = Display(local_ip, listen_port)
 
     nwins = len(display.get_windows())
@@ -1510,7 +1548,9 @@ if __name__ == "__main__":
 
     theme = Theme(theme_name)
     logging.info("Using theme: {}".format(theme_name))
+    logging.info("URIs: {}".format(uris))
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
+    logging.info("Playlist: {}".format(playlist))
     threads = playlist.start_player(probe_ip)
     logging.info("Started {} player".format(len(threads)))
     iss = Iss(threads)
