@@ -280,10 +280,15 @@ class Theme:
 
     def __init__(self, name="default"):
         self.name = name
-        self.img_bg = "themes/" + self.name + "/background.jpg"
         self.font = ""
         self.font_face = "Monospace"
+        path = "themes/" + self.name + "/background.jpg"
+        if os.path.exists(path):
+            self.img_bg = path
+        else:
+            self.img_bg = False
 
+        self.img_bg = False
 
 class Playlist:
 
@@ -1080,9 +1085,6 @@ class Wayland_view:
         logging.info("Exiting wayland view: {}".format(view.shutdowncode))
 
     def show_text(self, texts, img_bg=False, fullscreen=False):
-        if img_bg:
-            self.s_objects[0]["file"] = img_bg
-
         logging.info("view: Have {} text block(s)".format(len(texts)))
 
         n = 0
@@ -1091,10 +1093,16 @@ class Wayland_view:
             self.s_objects[n]["text"] = html.escape(str(text).replace("&", "&amp;"))
             n += 1
 
+        if img_bg:
+            self.s_objects[0]["file"] = img_bg
+            draw_function = view.draw_images_with_text
+        else:
+            draw_function = view.draw_text
+
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_images_with_text,
+                        redraw=draw_function,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
