@@ -11,3 +11,7 @@ Pillow >= 9.2.0
 selenium >= 4.4.3
 xkbcommon >= 0.4
 git+https://github.com/bbusse/python-zeroconf@workaround-1088#egg=zeroconf
+
+# ASGI server support
+asgiref >= 3.7.2
+daphne >= 4.0.0

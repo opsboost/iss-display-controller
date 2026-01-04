@@ -26,8 +26,15 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
 import draw as view
 import wayland.protocol
+try:
+    from asgiref.wsgi import WsgiToAsgi
+except Exception:
+    WsgiToAsgi = None
 
 wserver = Flask(__name__)
+asgi_app = WsgiToAsgi(wserver) if WsgiToAsgi else None
+if asgi_app is None:
+    logging.warning("ASGI: 'asgiref' not installed. Install 'asgiref' to run via Daphne.")
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"clock":        "humanbeans_clock",
@@ -2133,5 +2140,15 @@ if __name__ == "__main__":
     # Change view regularly
     display.start_time = time.time()
 
-    # Start webserver
-    wserver.run(host=listen_address)
+    # Start ASGI server via Daphne
+    try:
+        cmd = ['/home/swayvnc/venv/bin/daphne', '-b', listen_address, '-p', str(listen_port), 'controller:asgi_app']
+        logging.info("Starting Daphne ASGI server on %s:%s" % (listen_address, listen_port))
+        # Ensure the controller directory is importable so Daphne can import 'controller:asgi_app'
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        env_mod = os.environ.copy()
+        env_mod['PYTHONPATH'] = module_dir + (os.pathsep + env_mod['PYTHONPATH'] if 'PYTHONPATH' in env_mod else '')
+        subprocess.run(cmd, env=env_mod)
+    except FileNotFoundError:
+        logging.error("Daphne not found. Install 'daphne' to run the ASGI server.")
+        sys.exit(1)
