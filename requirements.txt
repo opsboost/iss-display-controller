@@ -6,6 +6,7 @@ requests >= 2.28.1
 paho-mqtt >= 1.6.1
 pangocffi >= 0.11.0
 pangocairocffi >= 0.7.0
+git+https://github.com/bbusse/py3status@oneshot#egg=py3status
 Pillow >= 9.2.0
 selenium >= 4.4.3
 xkbcommon >= 0.4

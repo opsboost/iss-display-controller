@@ -7,6 +7,7 @@ from hnapi import HnApi
 import html
 import json
 import logging
+from logging import DEBUG
 import os
 from paho.mqtt import client as mqtt_client
 from pathlib import Path
@@ -71,32 +72,16 @@ def screen():
 def probe_liveness():
     return "OK"
 
-
 @wserver.route("/screenshot")
 def display_screenshot():
     fn = display.screenshot()
-    if not os.path.isfile(fn):
-        logging.error("screenshot: File {} does not exist".format(fn))
-        #return False
+    logging.error("screenshot: File {} does not exist".format(fn))
+    #return False
     return send_file(fn, mimetype='image/png')
-
 
 def which(cmd):
     def is_exe(fpath):
         return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
-
-    fpath, fname = os.path.split(cmd)
-    if fpath:
-        if is_exe(cmd):
-            return cmd
-    else:
-        for path in os.environ["PATH"].split(os.pathsep):
-            exe_file = os.path.join(path, cmd)
-            if is_exe(exe_file):
-                return exe_file
-
-    return None
-
 
 def download_file(url, path, use_curl=True):
     logging.info("Downloading: " + url)
@@ -132,11 +117,155 @@ def skip_comments(file):
             yield line.strip()
 
 
+def create_playlist_item_crd(num, uri, player, playtime_s, name="playlistitem-sample", namespace="default"):
+    """
+    Create a Kubernetes CRD manifest for a PlaylistItem.
+
+    Args:
+        num (int): The item number.
+        uri (str): The URI of the item.
+        player (str): The player type.
+        playtime_s (int): Play time in seconds.
+        name (str): Name of the PlaylistItem resource.
+        namespace (str): Namespace for the resource.
+
+    Returns:
+        dict: The CRD manifest as a Python dictionary.
+    """
+    return {
+        "apiVersion": "example.com/v1",
+        "kind": "PlaylistItem",
+        "metadata": {
+            "name": name,
+            "namespace": namespace
+        },
+        "spec": {
+            "num": num,
+            "uri": uri,
+            "player": player,
+            "playtime_s": playtime_s
+        }
+    }
+
+def draw_apod(output='terminal', center=False, img_bg=False):
+    """
+    Draws the Astronomy Picture of the Day (APOD) for the current day.
+    Args:
+        output (str): 'terminal' to print to terminal, 'wayland-view' to render via Wayland_view.
+        center (bool): Center the APOD in the terminal (only for terminal output).
+        img_bg (bool): Use an image background if available.
+    """
+    apod = APOD()
+    img_path, desc = apod.apod_data()
+    if not img_path or not desc:
+        logging.error("Failed to fetch APOD data.")
+        return
+
+    if output == 'terminal':
+        print(desc)
+    elif output == 'wayland-view':
+        view = Wayland_view(display.res_x, display.res_y, 1, theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        view.show_image(img_path)
+
+def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False):
+    """
+    Draws a calendar for the current month, highlighting the current day and day name.
+    Args:
+        output (str): 'terminal' to print to terminal, 'wayland-view' to render via Wayland_view.
+        view_x_res (int): X resolution for wayland-view output (required if output='wayland-view').
+        center (bool): Center the calendar in the terminal (only for terminal output).
+    """
+    import calendar
+    import datetime
+    import re
+    import shutil
+
+    today = datetime.date.today()
+    cal = calendar.TextCalendar(calendar.MONDAY)
+    month_str = cal.formatmonth(today.year, today.month)
+    lines = month_str.split('\n')
+    highlighted_lines = []
+    day_str = str(today.day).rjust(2)
+    day_name = today.strftime("%A")
+
+    for line in lines:
+        # Highlight the current day
+        def highlight(match):
+            if output == 'terminal':
+                return f"\033[1;7m{match.group(0)}\033[0m"
+            elif output == 'wayland-view':
+                font_face = "Monospace"
+                font_size = 20
+                font_face_hilight = "Monospace"
+                font_size_hilight = 23
+                markup = "</span><span foreground=\"orange\" font=\"{} {}\">{}</span><span foreground=\"white\" font=\"{} {}\">".format(
+                    font_face_hilight,
+                    font_size_hilight,
+                    match.group(0),
+                    font_face,
+                    font_size
+                )
+                return markup
+
+        # Highlight the current day
+        def highlight_day_name(match):
+            if output == 'terminal':
+                return f"\033[1;7m{match.group(0)}\033[0m"
+            elif output == 'wayland-view':
+                return f"<span foreground=\"orange\" font=\"Monospace 23\">{match.group(0)}</span>"
+
+        # Apply highlights if present
+        line = re.sub(rf'(?<!\d){day_str}(?!\d)', highlight, line)
+        line = re.sub(rf'\b{today.strftime("%a")}\b', highlight_day_name, line)
+        highlighted_lines.append(line)
+
+    if output == 'terminal':
+        if center:
+            # Get terminal width
+            try:
+                width = shutil.get_terminal_size((80, 20)).columns
+            except Exception:
+                width = 80
+
+            centered_lines = []
+
+            for line in highlighted_lines:
+                # Remove ANSI codes for length calculation
+                line_stripped = re.sub(r'\033\[[0-9;]*m', '', line)
+                pad = max((width - len(line_stripped)) // 2, 0)
+                centered_lines.append(' ' * pad + line)
+
+            print("\n".join(centered_lines))
+        else:
+            print("\n".join(highlighted_lines))
+
+    elif output == 'wayland-view':
+        texts = []
+        texts.append("\n".join(highlighted_lines))
+        # Add next 3 bank holidays under the calendar
+        holidays = next_bank_holidays(location="Germany", count=3)
+        if holidays:
+            holiday_lines = []
+            for h in holidays:
+                # Format: "YYYY-MM-DD: Holiday Name (Local Name)"
+                holiday_lines.append(f"{h['date']}: {h['name']} ({h['localName']})")
+            texts.append("\n".join(holiday_lines))
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        if len(texts) > 1:
+            view.s_objects[1]["font_size"] = 16
+            view.s_objects[1]["alignment"] = "left"
+        view.show_text(texts, img_bg, html_escape=False)
+
+
 class System:
 
     def list_processes(limit=0):
         # Processes without kernel threads
-        cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect']
+        cmd = ['ps', 'wux', '--ppid', '2', '-p', '2', '--deselect']
 
         # FreeBSD
         cmd = ['ps', 'ux']
@@ -187,7 +316,7 @@ class System:
         data = ""
         f = open('/etc/resolv.conf')
         for line in skip_comments(f):
-            data += line
+            data += line + "\n"
         return data
 
     def net_valid_ip_address(ip_address):
@@ -197,12 +326,13 @@ class System:
             try:
                 socket.inet_pton(socket.AF_INET6, address)
             except:
-                logging.warning('%s is an invalid IP address' % (ip_addr))
+                logging.warning('%s is an invalid IP address' % (ip_address))
                 return False
 
         return True
 
     def net_iface_address(ip_address):
+        ip_address = "9.9.9.9"
 
         try:
             socket.inet_pton(socket.AF_INET6, ip_address)
@@ -212,7 +342,7 @@ class System:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 socket.inet_pton(socket.AF_INET, ip_address)
             except:
-                logging.warning('%s is an invalid IP address' % (ip_addr))
+                logging.warning('%s is an invalid IP address' % (ip_address))
                 return False
 
         try:
@@ -288,8 +418,6 @@ class Theme:
         else:
             self.img_bg = False
 
-        self.img_bg = False
-
 class Playlist:
 
     def __init__(self,
@@ -327,6 +455,16 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "browser"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-apod://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "apod"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-cal://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "calendar"
+                item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-clock://"):
                 item["num"] = n
                 item["uri"] = uri
@@ -342,7 +480,7 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "music"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-net://"):
+            elif uri.startswith("iss-network://"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "network"
@@ -354,6 +492,13 @@ class Playlist:
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "news"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-otd://"):
+                otd_sources = {"wikipedia" : ""},
+                self.otd = OTD(otd_sources)
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "onthisday"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-proc://"):
                 item["num"] = n
@@ -399,13 +544,19 @@ class Playlist:
     def start_player(self, probe_ip):
         threads = list()
         for item in self.playlist:
-            if item["player"] == "browser":
+            if item["player"] == "apod":
+                x = threading.Thread(target=self.start_apod,
+                                     args=())
+            elif item["player"] == "browser":
                 # start_browser() wants a list
                 # but we want to start an instance for each URL
                 urls = list()
                 urls.append(item["uri"])
                 x = threading.Thread(target=self.start_browser,
                                      args=(urls,))
+            elif item["player"] == "calendar":
+                x = threading.Thread(target=self.start_calendar,
+                                     args=())
             elif item["player"] == "clock":
                 x = threading.Thread(target=self.start_clock,
                                      args=())
@@ -421,10 +572,15 @@ class Playlist:
                                      args=(self.theme.img_bg,))
             elif item["player"] == "network":
                 x = threading.Thread(target=self.start_net_view,
-                                     args=(self.theme))
+                                     args=(self.theme.img_bg,
+                                           probe_ip))
             elif item["player"] == "news":
                 x = threading.Thread(target=self.start_news_view,
                                      args=(self.news,
+                                           self.theme.img_bg,))
+            elif item["player"] == "onthisday":
+                x = threading.Thread(target=self.start_onthisday_view,
+                                     args=(self.otd,
                                            self.theme.img_bg,))
             elif item["player"] == "processes":
                 x = threading.Thread(target=self.start_proc_view,
@@ -446,6 +602,10 @@ class Playlist:
 
         return threads
 
+    def start_apod(self, center=False, img_bg=False):
+        logging.info("Starting APOD")
+        draw_apod('wayland-view', center=center, img_bg=img_bg)
+
     def start_browser(self, urls):
         cmd = ['webdriver_util.py']
         for url in urls:
@@ -459,6 +619,10 @@ class Playlist:
               encoding='utf8')
 
         return True
+
+    def start_calendar(self, center=False, img_bg=False):
+        logging.info("Starting calendar")
+        draw_calendar('wayland-view', center=center, img_bg=img_bg)
 
     def start_clock(self):
         logging.info("Starting clock")
@@ -517,7 +681,8 @@ class Playlist:
 
         return True
 
-    def start_net_view(self, probe_ip, img_bg):
+    def start_net_view(self, img_bg, probe_ip):
+        logging.info("Starting network view")
         texts = list()
         net = System.net_data(probe_ip)
         texts.append(net["address"])
@@ -525,10 +690,14 @@ class Playlist:
         texts.append(net["public_ip"])
         texts.append(net["resolvconf"])
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.s_objects[0]["font_size"] = 14
+        view.s_objects[0]["font_size"] = 20
         view.s_objects[0]["alignment"] = "left"
-        view.s_objects[1]["font_size"] = 14
+        view.s_objects[1]["font_size"] = 20
         view.s_objects[1]["alignment"] = "left"
+        view.s_objects[2]["font_size"] = 20
+        view.s_objects[2]["alignment"] = "left"
+        view.s_objects[3]["font_size"] = 20
+        view.s_objects[3]["alignment"] = "left"
         view.show_text(texts, img_bg)
 
     def start_proc_view(self, img_bg):
@@ -540,18 +709,19 @@ class Playlist:
         view.show_text(texts, img_bg)
 
     def start_sys_view(self, img_bg, probe_ip):
+        logging.info("Starting sys view")
         net = System.net_data(probe_ip)
         sys = System.sys_data()
         texts = list()
         texts.append(System.os_release())
         texts.append(System.uptime())
         texts.append(sys["uptime"])
+        texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
         texts.append(sys["data"])
         texts.append(net["address"])
         texts.append(net["addresses"])
-        texts.append(net["online_status"] + " " + net["public_ip"])
+        texts.append(str(net["online_status"]) + " " + str(net["public_ip"]))
         texts.append(f"Listen address: {display.address}:{display.port}")
-        texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 24
         view.s_objects[0]["alignment"] = "left"
@@ -574,6 +744,7 @@ class Playlist:
         view.show_text(texts, img_bg)
 
     def start_weather_view(self, weather, img_bg):
+        logging.info("Starting weather view")
         texts = list()
         data, icon = weather.current_weather()
 
@@ -587,6 +758,41 @@ class Playlist:
                      + " " +
                      data["current_condition"][0]["windspeedKmph"] + " km/h")
         texts.append(data["nearest_area"][0]["areaName"][0]["value"])
+
+        # Add dawn and sunset for today
+        dawn_sunset_times = dawn_sunset(location=weather.location)
+        if not dawn_sunset_times:
+            logging.info(f"No dawn/sunset data returned for location: {weather.location}")
+        elif "today" not in dawn_sunset_times:
+            logging.info(f"'today' key missing in dawn/sunset data for location: {weather.location}: {dawn_sunset_times}")
+        else:
+            dawn = dawn_sunset_times["today"].get("dawn")
+            sunset = dawn_sunset_times["today"].get("sunset")
+            if not dawn:
+                logging.info(f"No 'dawn' value in dawn/sunset data for location: {weather.location}: {dawn_sunset_times['today']}")
+            if not sunset:
+                logging.info(f"No 'sunset' value in dawn/sunset data for location: {weather.location}: {dawn_sunset_times['today']}")
+            if dawn and sunset:
+                texts.append(f"Dawn: {dawn}  Sunset: {sunset}")
+
+        # Add a margin (empty line) between location and moon data
+        texts.append("")
+
+        # Add moon phase and icon
+        moon_phase, moon_icon, days_until_full_moon = moonphase(location=weather.location)
+        if moon_phase:
+            moon_line = f"Moon: {moon_phase}"
+            if days_until_full_moon is not None:
+                moon_line += f" ({days_until_full_moon} days to full)"
+            texts.append(moon_line)
+            if moon_icon:
+                texts.append(moon_icon)
+
+        # Fetch and display UV index
+        uv_index = fetch_uv_index(location=weather.location)
+        if uv_index:
+            texts.append(f"UV Index: {uv_index}")
+
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 80
         view.s_objects[0]["alignment"] = "left"
@@ -594,7 +800,17 @@ class Playlist:
         view.s_objects[1]["alignment"] = "left"
         view.s_objects[2]["font_size"] = 20
         view.s_objects[2]["alignment"] = "left"
+        # Optionally set font size/alignment for extra lines
+        for i in range(3, len(texts)):
+            view.s_objects[i]["font_size"] = 20
+            view.s_objects[i]["alignment"] = "left"
         view.show_text(texts, img_bg)
+        # Show weather icon (already shown as first text if present)
+        # Show moon icon if present and not already shown
+        # (If you want to show as image, uncomment below)
+        # if moon_icon:
+        #     view.show_image(moon_icon)
+        # else:
         view.show_image(icon)
 
     def start_music_view(self, img_bg):
@@ -615,6 +831,24 @@ class Playlist:
         view.s_objects[0]["font_size"] = 30
         view.s_objects[1]["font_size"] = 60
         view.s_objects[2]["font_size"] = 30
+        view.show_text(texts, img_bg)
+
+    def start_onthisday_view(self, otd, img_bg):
+        texts = list()
+        item = otd.otd_item()
+        if item is None:
+            texts.append("No 'On This Day' data available.")
+        else:
+            texts.append(item["year"])
+            # Add a margin (empty line) between the year and the text
+            texts.append("")
+            texts.append(item["text"])
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        for i in range(len(texts)):
+            if i == 0:
+                view.s_objects[i]["font_size"] = 40
+            else:
+                view.s_objects[i]["font_size"] = 30
         view.show_text(texts, img_bg)
 
     def start_image_view(self, file):
@@ -819,6 +1053,38 @@ class MQTT:
         client.on_message = on_message
 
 
+class OTD:
+
+    def __init__(self, sources):
+        import datetime
+        today = datetime.date.today()
+        month = today.month
+        day = today.day
+        url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{month}/{day}"
+        self.events = []
+
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            data = response.json()
+            for event in data.get("events", []):
+                logging.info(f"{event['year']}: {event['text']}")
+                self.events.append(event)
+        else:
+            logging.error("Failed to fetch otd data")
+
+    def otd_item(self):
+        n = {"year": "",
+             "text": ""}
+
+        if not self.events:
+            return None
+
+        n["year"] = self.events[0].get('year')
+        n["text"] = self.events[0].get('text')
+        return n
+
+
 class News:
 
     def __init__(self, sources):
@@ -879,7 +1145,7 @@ class Py3status:
         self.module_name = module_name
         self.config_common = """
 general {
-    colors = true
+    colors = false
     interval = 5
     color_good = "#96b5b4"
 }
@@ -898,7 +1164,7 @@ net_iplist {
     format = "{format_iface}"
 }
 """
-        self.module_config["sysdata"] = self.config_common + """
+        self.module_config["sysdata"] = self.config_common + r"""
 order = "sysdata"
 
 sysdata {
@@ -914,7 +1180,7 @@ sysdata {
         self.module_config["online_status"] = self.config_common + """
 order = "online_status"
 """
-        self.module_config["uptime"] = self.config_common + """
+        self.module_config["uptime"] = self.config_common + r"""
 order = "uptime"
 
 uptime {
@@ -929,39 +1195,79 @@ whatismyip {
         format = '{icon} {ip} {country} {city}'
 }
 """
+        self.config_path = self.write_config()
+        self.output = {}  # Store latest output per module
 
     def run_module(self):
-        config_file = self.write_config()
-        cmd = 'py3status -c ' + config_file.name
-        logging.info(f"Py3status: Running module {self.module_name} {cmd}")
-        p = subprocess.Popen(cmd, shell=True,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT,
-                                  start_new_session=True,
-                                  close_fds=True,
-                                  encoding="utf8")
-        output, error = p.communicate()
-        output = output.replace("\n", "")
-        output = output.replace("[", "")
-        output = output.replace("]", "")
-        output = "[" + output + "]"
-        config_file.close()
+        cmd = ['py3status', '-c', self.config_path, '-o']
+        exists = os.path.exists(self.config_path)
+        readable = os.access(self.config_path, os.R_OK)
 
+        logging.info(f"py3status config path: {self.config_path}, exists={exists}, readable={readable}")
+
+        if readable:
+            try:
+                with open(self.config_path, 'r', encoding='utf8') as cf:
+                    logging.info(f"py3status config:\n{cf.read()}")
+            except Exception as e:
+                logging.warning(f"py3status: failed reading config content: {e}")
+
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding='utf8'
+        )
+        stdout, stderr = p.communicate()
+        logging.info(f"py3status ({self.module_name}):\n{stdout}")
+
+        if stderr:
+            logging.debug(f"py3status stderr ({self.module_name}): {stderr.strip()}")
+
+        data = None
+        if stdout:
+            lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+            tail = []
+            for i in range(len(lines) - 1, -1, -1):
+                tail.insert(0, lines[i])
+                try:
+                    data = json.loads("\n".join(tail))
+                    break
+                except Exception:
+                    continue
+
+        # Extract full_text
+        result = data
         try:
-            module_data = json.loads(output)
-            module_data = module_data[1]["full_text"]
-        except ValueError as e:
-            logging.error(f"Py3status: Failed to parse output as JSON: {output}")
-            return False
+            if isinstance(data, dict) and 'full_text' in data:
+                result = data['full_text']
+            elif isinstance(data, list):
+                blocks = data[-1] if (data and isinstance(data[-1], list)) else data
+                if isinstance(blocks, list):
+                    for blk in reversed(blocks):
+                        if isinstance(blk, dict) and 'full_text' in blk:
+                            result = blk['full_text']
+                            break
+        except Exception:
+            pass
 
-        return module_data
+        # Fallback: regex the last full_text from raw stdout
+        if result is None:
+            import re
+            matches = re.findall(r'"full_text"\s*:\s*"([^"]+)"', stdout or '')
+            if matches:
+                result = matches[-1]
+
+        logging.info(f"py3status ({self.module_name}) parsed: {result}")
+        return result
 
     def write_config(self):
-        tmp = tempfile.NamedTemporaryFile()
-        tmp.write(self.module_config[self.module_name].encode())
-        tmp.seek(0)
-
-        return tmp
+        tmp = tempfile.NamedTemporaryFile(delete=False, mode='w+', encoding='utf-8')
+        # Always write only the config for this module
+        tmp.write(self.module_config[self.module_name])
+        tmp.flush()
+        tmp.close()
+        return tmp.name
 
 
 class Weather:
@@ -974,29 +1280,25 @@ class Weather:
         url = "https://wttr.in/{}?format=j1".format(self.location)
         logging.info("iss-weather: Fetching weather for {} at {}"
                      .format(self.location, url))
-
+        data = None
+        icon = None
         try:
-            data = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10)
+            if response and response.content:
+                try:
+                    data = json.loads(response.content)
+                    icon = self.icon(data["current_condition"][0]["weatherDesc"][0]["value"])
+                except (ValueError, KeyError, IndexError) as e:
+                    logging.error("weather: Failed to decode or parse data")
+                    logging.error(e)
+                    data = None
+                    icon = None
+            else:
+                logging.error("Failed to fetch weather data: empty response")
         except requests.ReadTimeout as e:
-            logging.error("weather: Timeout for request {}"
-                          .format(e))
-        except Exception:
-            logging.error("weather: Error requesting weather")
-
-        if not data:
-            logging.error("Failed to fetch weather data")
-
-        try:
-            data = data.content
-            data = json.loads(data)
-        except ValueError as e:
-            logging.error("weather: Failed to decode data")
-            logging.error(e)
-            data = {}
-            sys.exit(1)
-
-        icon = self.icon(data["current_condition"][0]["weatherDesc"][0]["value"])
-
+            logging.error("weather: Timeout for request {}".format(e))
+        except Exception as e:
+            logging.error("weather: Error requesting weather: {}".format(e))
         return data, icon
 
     def icon(self, condition):
@@ -1015,6 +1317,9 @@ class Weather:
         return fn
 
     def current_weather(self):
+        # Always return a tuple for unpacking
+        if self.weather is None:
+            return None, None
         return self.weather
 
 
@@ -1058,9 +1363,12 @@ class Wayland_view:
                     "offset_x": 10,
                     "offset_y": 10,
                     "bg_alpha": 1,
-                    "bg_colour_r": 7,
-                    "bg_colour_g": 59,
-                    "bg_colour_b": 76,
+                    #"bg_colour_r": 7,
+                    #"bg_colour_g": 59,
+                    #"bg_colour_b": 76,
+                    "bg_colour_r": 40,
+                    "bg_colour_g": 15,
+                    "bg_colour_b": 40,
                     "font": theme.font,
                     "font_face": theme.font_face,
                     "font_size": 60,
@@ -1084,13 +1392,16 @@ class Wayland_view:
         self.conn.disconnect()
         logging.info("Exiting wayland view: {}".format(view.shutdowncode))
 
-    def show_text(self, texts, img_bg=False, fullscreen=False):
+    def show_text(self, texts, img_bg=False, fullscreen=False, html_escape=True):
         logging.info("view: Have {} text block(s)".format(len(texts)))
 
         n = 0
         for text in texts:
             logging.debug(f"Showing text: {text}")
-            self.s_objects[n]["text"] = html.escape(str(text).replace("&", "&amp;"))
+            if html_escape:
+                self.s_objects[n]["text"] = html.escape(str(text).replace("&", "&amp;"))
+            else:
+                self.s_objects[n]["text"] = str(text).replace("&", "&amp;")
             n += 1
 
         if img_bg:
@@ -1112,10 +1423,11 @@ class Wayland_view:
         self.s_objects[0]["texts"] = list()
         self.s_objects[0]["file"] = img_file
         self.s_objects[0]["bg_alpha"] = 0
+        self.s_objects[0]["offset_y"] = 0
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_images_with_text,
+                        redraw=draw_function,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -1136,8 +1448,8 @@ class Display:
         self.screenshot_file = "screenshot.png"
         self.socket_path = self.get_socket_path()
 
-        logging.info("Resolution: {} x {}"
-                     .format(self.res_x, self.res_y))
+        logging.info(f"Python executable: {sys.executable}")
+        logging.info(f"Resolution: {self.res_x} x {self.res_y}")
 
         # We do not want to handle existing windows,
         # so we put their IDs on a blacklist
@@ -1231,7 +1543,8 @@ class Display:
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
                 if len(self.switching_windows) == 0:
-                    logging.debug("display: Expected windows to display but there is none")
+                    logging.debug("display: Expected no windows but found {}"
+                                  .format(nwins))
 
                     continue
 
@@ -1305,6 +1618,205 @@ class Iss:
     def __init__(self, threads):
         self.threads = threads
 
+
+def moonphase(location="Berlin"):
+    """
+    Fetches the current moon phase and icon from wttr.in for the given location.
+    Returns:
+        tuple: (moon_phase_text, moon_icon_url, days_until_full_moon) or (None, None, None) on failure.
+    """
+    import datetime
+
+    url = f"https://wttr.in/{location}?format=j1"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        # The moon phase is in the first day's astronomy section
+        moon_phase = data["weather"][0]["astronomy"][0]["moon_phase"]
+        moon_icon = data["weather"][0]["astronomy"][0].get("moon_icon", None)
+        # wttr.in does not always provide a direct icon URL, so we map phase to icon if needed
+        moon_icon_map = {
+            "New Moon": "new-moon",
+            "Waxing Crescent": "waxing-crescent",
+            "First Quarter": "first-quarter",
+            "Waxing Gibbous": "waxing-gibbous",
+            "Full Moon": "full-moon",
+            "Waning Gibbous": "waning-gibbous",
+            "Last Quarter": "last-quarter",
+            "Waning Crescent": "waning-crescent"
+        }
+        if not moon_icon:
+            icon_name = moon_icon_map.get(moon_phase, "moon")
+            moon_icon = f"https://wttr.in/files/{icon_name}.png"
+
+        # Calculate days until next full moon
+        today = datetime.date.today()
+        days_until_full_moon = None
+        # Look ahead in the weather forecast for the next full moon
+        for day in data.get("weather", []):
+            astronomy = day.get("astronomy", [])
+            if astronomy and astronomy[0].get("moon_phase") == "Full Moon":
+                date_str = day.get("date")
+                if date_str:
+                    date_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    delta = (date_obj - today).days
+                    if delta >= 0:
+                        days_until_full_moon = delta
+                        break
+        return moon_phase, moon_icon, days_until_full_moon
+    except Exception as e:
+        logging.error(f"Failed to fetch moonphase: {e}")
+        return None, None, None
+
+
+def dawn_sunset(location="Berlin"):
+    """
+    Fetches dawn and sunset times for today and tomorrow from wttr.in for the given location.
+    Returns:
+        dict: {
+            "today": {"dawn": str, "sunset": str},
+            "tomorrow": {"dawn": str, "sunset": str}
+        }
+        or None on failure.
+    """
+    url = f"https://wttr.in/{location}?format=j1"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        result = {}
+        weather = data.get("weather", [])
+        for idx, key in zip([0, 1], ["today", "tomorrow"]):
+            if idx < len(weather):
+                astronomy = weather[idx].get("astronomy", [{}])[0]
+                dawn = astronomy.get("dawn", None)
+                sunset = astronomy.get("sunset", None)
+                result[key] = {"dawn": dawn, "sunset": sunset}
+        return result
+    except Exception as e:
+        logging.error(f"Failed to fetch dawn/sunset: {e}")
+        return None
+
+
+def next_bank_holidays(location="Germany", count=3):
+    """
+    Fetches the next `count` bank holidays for the given location using the Nager.Date API.
+    Returns:
+        list of dicts: [{ "date": "YYYY-MM-DD", "localName": "Holiday Name", "name": "English Name" }, ...]
+        or None on failure.
+    """
+    # Map some common location names to country codes for Nager.Date API
+    country_map = {
+        "Germany": "DE",
+        "DE": "DE",
+        "United Kingdom": "GB",
+        "UK": "GB",
+        "Great Britain": "GB",
+        "France": "FR",
+        "FR": "FR",
+        "United States": "US",
+        "USA": "US",
+        "US": "US",
+        "Austria": "AT",
+        "AT": "AT",
+        "Switzerland": "CH",
+        "CH": "CH",
+    }
+    import datetime
+    today = datetime.date.today()
+    year = today.year
+    country_code = country_map.get(location, location)
+    url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/{country_code}"
+    try:
+        resp = requests.get(url, timeout=10)
+        holidays = resp.json()
+        # Filter for holidays after today
+        upcoming = [
+            h for h in holidays
+            if datetime.datetime.strptime(h["date"], "%Y-%m-%d").date() >= today
+        ]
+        # If not enough holidays left this year, fetch next year as well
+        if len(upcoming) < count:
+            url_next = f"https://date.nager.at/api/v3/PublicHolidays/{year+1}/{country_code}"
+            resp_next = requests.get(url_next, timeout=10)
+            holidays_next = resp_next.json()
+            upcoming += holidays_next
+            # Filter again for only future holidays
+            upcoming = [
+                h for h in upcoming
+                if datetime.datetime.strptime(h["date"], "%Y-%m-%d").date() >= today
+            ]
+        # Return the next `count` holidays
+        return [
+            {
+                "date": h["date"],
+                "localName": h["localName"],
+                "name": h["name"]
+            }
+            for h in upcoming[:count]
+        ]
+    except Exception as e:
+        logging.error(f"Failed to fetch bank holidays: {e}")
+        return None
+
+
+def fetch_uv_index(location="Berlin"):
+    """
+    Fetches the UV index for the given location from wttr.in.
+    Returns:
+        str: The UV index as a string, or None on failure.
+    """
+    url = f"https://wttr.in/{location}?format=%u"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return response.text.strip()
+        else:
+            logging.error(f"Failed to fetch UV index: HTTP {response.status_code}")
+    except Exception as e:
+        logging.error(f"Error fetching UV index: {e}")
+    return None
+
+
+class APOD:
+    def __init__(self, api_key="DEMO_KEY", save_dir="/tmp"):
+        self.api_key = api_key
+        self.save_dir = save_dir
+
+    def apod_data(self):
+        """
+        Downloads NASA's Astronomy Picture of the Day (APOD) and returns its description text.
+        Returns:
+            tuple: (image_path, description_string) or (None, None) on failure.
+        """
+        apod_url = f"https://api.nasa.gov/planetary/apod?api_key={self.api_key}"
+        try:
+            resp = requests.get(apod_url, timeout=10)
+            if resp.status_code != 200:
+                logging.error(f"APOD: Failed to fetch metadata: {resp.status_code}")
+                return None, None
+            data = resp.json()
+            img_url = data.get("hdurl") or data.get("url")
+            desc = data.get("explanation", "")
+            if not img_url:
+                logging.error("APOD: No image URL found in response")
+                return None, None
+
+            # Download image
+            img_resp = requests.get(img_url, timeout=10)
+            if img_resp.status_code != 200:
+                logging.error(f"APOD: Failed to download image: {img_resp.status_code}")
+                return None, None
+
+            img_ext = os.path.splitext(img_url)[-1]
+            img_path = os.path.join(self.save_dir, f"apod{img_ext}")
+            with open(img_path, "wb") as f:
+                f.write(img_resp.content)
+
+            # Return image path and description string
+            return img_path, desc
+        except Exception as e:
+            logging.error(f"APOD: Error fetching APOD: {e}")
+            return None, None
 
 if __name__ == "__main__":
 
@@ -1443,11 +1955,13 @@ if __name__ == "__main__":
                         default="_http._tcp.local.")
 
     args = parser.parse_args()
-    # workaround: Make url a new list if first element contains a '|'
-    # since we can specify --uri multiple times but not URI as
-    # an env var. We use pipe: | as seperator since it is not allowed in URIs
-    if args.uris[0].find("|") != -1:
-        args.uris = args.uris[0].split("|")
+    if isinstance(args.uris, str):
+        uris_list = [args.uris]
+    else:
+        uris_list = args.uris
+    if uris_list and isinstance(uris_list[0], str) and "|" in uris_list[0]:
+        uris_list = uris_list[0].split("|")
+    args.uris = uris_list
     # Same for MQTT topics
     if args.mqtt_topics and gs.mqtt_topics[0].find("|") != -1:
         args.mqtt_topics[0] = args.mqtt_topics[0].split("|")
@@ -1474,6 +1988,7 @@ if __name__ == "__main__":
     zc_service_type = args.zeroconf_service_type
     logfile = args.logfile
     loglevel = args.loglevel
+    loglevel = DEBUG
     log_format = '[%(asctime)s] \
     {%(filename)s:%(lineno)d} %(levelname)s - %(message)s'
     del locals()['args']
@@ -1541,8 +2056,7 @@ if __name__ == "__main__":
     path_update = "/tmp/controller-updated"
     if update_controller and not os.path.exists(path_update):
         logging.info("Updating self..")
-        #download_file(controller_update_url, os.path.abspath(__file__), False)
-        download_file(controller_update_url, os.path.abspath("/tmp/" + os.path.basename(__file__)), False)
+        #download_file(controller_update_url, os.path.abspath("/tmp/" + os.path.basename(__file__)), False)
         with open(path_update, "w") as file:
             file.write("Update done\n")
         reexec_self()
@@ -1560,7 +2074,11 @@ if __name__ == "__main__":
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
     logging.info("Playlist: {}".format(playlist))
     threads = playlist.start_player(probe_ip)
-    logging.info("Started {} player".format(len(threads)))
+    started = len(threads)
+    expected = len(playlist.playlist)
+    logging.info("Started {} {}".format(started, "player" if started == 1 else "players"))
+    if expected != started:
+        logging.info("Players started mismatch: expected {} from URIs, started {}".format(expected, started))
     iss = Iss(threads)
 
     stream = Stream(stream_source)
