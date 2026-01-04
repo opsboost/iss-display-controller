@@ -75,16 +75,17 @@ def screen():
     json_data = json.dumps(data)
     return json_data
 
+@wserver.route("/screenshot")
+def display_screenshot():
+    fn = screenshot()
+    if not os.path.exists(fn):
+        logging.error("screenshot: File {} does not exist".format(fn))
+        return ("Not Found", 404)
+    return send_file(fn, mimetype='image/png')
 
 def probe_liveness():
     return "OK"
 
-@wserver.route("/screenshot")
-def display_screenshot():
-    fn = display.screenshot()
-    logging.error("screenshot: File {} does not exist".format(fn))
-    #return False
-    return send_file(fn, mimetype='image/png')
 
 def which(cmd):
     def is_exe(fpath):
@@ -1607,17 +1608,18 @@ class Display:
 
     def screenshot(self):
         fn = self.screenshot_path + "/" + self.screenshot_file
+        return screenshot(fn)
 
-        logging.info("Saving screenshot to {}".format(fn))
-        cmd = [cmds["screenshot"],
-               fn]
-
-        p = Popen(cmd,
-                  env=env,
-                  start_new_session=True,
-                  close_fds=True)
-
-        return fn
+def screenshot(path=None):
+    if path is None:
+        path = "/tmp/screenshot.png"
+    logging.info("Saving screenshot to {}".format(path))
+    cmd = [cmds["screenshot"], path]
+    try:
+        subprocess.run(cmd, env=os.environ.copy(), check=False)
+    except Exception as e:
+        logging.error("screenshot: Failed to capture: {}".format(e))
+    return path
 
 
 class Iss:
