@@ -1,4 +1,4 @@
-FROM debian:11-slim AS build
+FROM debian:12-slim AS build
 LABEL maintainer="Björn Busse <bj.rn@baerlin.eu>"
 LABEL org.opencontainers.image.source https://github.com/opsboost/iss-display-controller
 LABEL org.label-schema.description="iss display controller"
