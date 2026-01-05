@@ -11,6 +11,7 @@ Pillow >= 11.3.0
 selenium >= 4.36.0
 xkbcommon >= 1.5.1
 git+https://github.com/bbusse/python-zeroconf@workaround-1088#egg=zeroconf
+git+https://github.com/bbusse/webdriver-util@main#egg=webdriver-util
 
 # ASGI server support
 asgiref >= 3.11.0
