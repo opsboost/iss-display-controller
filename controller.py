@@ -88,6 +88,39 @@ def display_screenshot(request):
 def api_screenshot(request):
     return display_screenshot(request)
 
+def list_routes(app_instance=None):
+    """
+    Return a list of all registered routes in the ASGI app.
+    Each entry contains: path, methods, and route name.
+    """
+    app_instance = app_instance or app
+
+    def _walk(routes, prefix=""):
+        collected = []
+        for r in routes:
+            # Starlette Mount has .routes for sub-paths
+            subroutes = getattr(r, "routes", None)
+            if subroutes is not None:
+                sub_prefix = prefix + getattr(r, "path", "")
+                collected.extend(_walk(subroutes, sub_prefix))
+                continue
+
+            path = prefix + getattr(r, "path", "")
+            methods = sorted(list(getattr(r, "methods", set()))) if hasattr(r, "methods") else []
+            name = getattr(r, "name", "")
+            collected.append({
+                "path": path,
+                "methods": methods,
+                "name": name,
+            })
+        return collected
+
+    return _walk(app_instance.routes)
+
+@app.route("/api/v1/routes", methods=["GET"]) 
+def api_routes(request):
+    return JSONResponse(list_routes())
+
 def probe_liveness():
     return "OK"
 
@@ -728,7 +761,7 @@ class Playlist:
         texts = list()
         texts.append(System.os_release())
         texts.append(System.uptime())
-        texts.append(f"Display started: {self.started}")
+        texts.append(f"Display started: {display.started}")
         texts.append(sys["uptime"])
         texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
         texts.append(sys["data"])
