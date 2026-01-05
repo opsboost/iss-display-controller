@@ -62,18 +62,21 @@ def healthz():
 
 @wserver.route("/screen")
 def screen():
-    data = {}
-    data["name"] = "display-0"
-    data["os_release"] = "iss-display"
-    data['listen_address'] = display.address
-    data['listen_port'] = display.port
-    data['res_x'] = display.res_x
-    data['res_y'] = display.res_y
-    data['playlist'] = playlist.playlist
-    data['uris'] = playlist.uris
-    data['streams'] = stream.streams
-    json_data = json.dumps(data)
-    return json_data
+    state = Display.query_state()
+    if not state:
+        return ("Service Unavailable", 503)
+    data = {
+        "name": "display-0",
+        "os_release": "iss-display",
+        "listen_address": state.get('address'),
+        "listen_port": state.get('port'),
+        "res_x": state.get('res_x'),
+        "res_y": state.get('res_y'),
+        "playlist": globals().get('playlist').playlist if 'playlist' in globals() else [],
+        "uris": globals().get('playlist').uris if 'playlist' in globals() else [],
+        "streams": globals().get('stream').streams if 'stream' in globals() else [],
+    }
+    return json.dumps(data)
 
 @wserver.route("/screenshot")
 def display_screenshot():
@@ -1455,12 +1458,20 @@ class Display:
         self.screenshot_path = "/tmp"
         self.screenshot_file = "screenshot.png"
         self.socket_path = self.get_socket_path()
+        # UDP state server defaults
+        self.state_udp_host = os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
+        self.state_udp_port = int(os.environ.get('DISPLAY_STATE_UDP_PORT', '6100'))
+        self._state_server_thread = None
+        self._state_server_stop = threading.Event()
+        self._state_server_sock = None
 
         logging.info(f"Python executable: {sys.executable}")
         logging.info(f"Resolution: {self.res_x} x {self.res_y}")
 
         # We do not want to handle existing windows,
         # so we put their IDs on a blacklist
+        # This is usually only useful in development/testing scenarios
+        # e.g. when run locally with an existing sway session
         existing_windows = self.get_windows()
         for win in existing_windows:
             self.window_blacklist.append(win["id"])
@@ -1470,6 +1481,94 @@ class Display:
 
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
+
+    def start_state_server(self, host=None, port=None):
+        if host:
+            self.state_udp_host = host
+        if port:
+            self.state_udp_port = port
+        if self._state_server_thread and self._state_server_thread.is_alive():
+            logging.info("Display UDP state server already running")
+            return True
+        self._state_server_stop.clear()
+        self._state_server_thread = threading.Thread(target=self._udp_state_server_loop, daemon=True)
+        self._state_server_thread.start()
+        logging.info(f"Started Display UDP state server on {self.state_udp_host}:{self.state_udp_port}")
+        return True
+
+    def stop_state_server(self):
+        self._state_server_stop.set()
+        # Kick the socket to unblock if waiting
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.sendto(b"STOP", (self.state_udp_host, self.state_udp_port))
+        except Exception:
+            pass
+        if self._state_server_thread:
+            self._state_server_thread.join(timeout=1.0)
+        if self._state_server_sock:
+            try:
+                self._state_server_sock.close()
+            except Exception:
+                pass
+        logging.info("Stopped Display UDP state server")
+        return True
+
+    def _udp_state_server_loop(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+            sock.bind((self.state_udp_host, self.state_udp_port))
+            self._state_server_sock = sock
+        except Exception as e:
+            logging.error(f"Display UDP server bind failed: {e}")
+            return
+
+        while not self._state_server_stop.is_set():
+            try:
+                data, addr = self._state_server_sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                logging.error(f"Display UDP server recv error: {e}")
+                continue
+
+            if not data:
+                continue
+            msg = data.decode('utf-8', errors='ignore').strip()
+            if msg == 'GET_STATE':
+                payload = {
+                    'address': self.address,
+                    'port': self.port,
+                    'res_x': self.res_x,
+                    'res_y': self.res_y,
+                }
+                try:
+                    self._state_server_sock.sendto(json.dumps(payload).encode('utf-8'), addr)
+                except Exception as e:
+                    logging.error(f"Display UDP server send error: {e}")
+            elif msg == 'STOP':
+                break
+            else:
+                # Ignore unknown messages
+                pass
+
+    @staticmethod
+    def query_state(host=None, port=None, timeout=0.5):
+        host = host or os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
+        port = int(port or os.environ.get('DISPLAY_STATE_UDP_PORT', '6100'))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.sendto(b'GET_STATE', (host, port))
+                data, _ = s.recvfrom(4096)
+                return json.loads(data.decode('utf-8'))
+        except socket.timeout:
+            logging.warning("Display UDP client: timeout querying state")
+            return None
+        except Exception as e:
+            logging.error(f"Display UDP client error: {e}")
+            return None
 
     def get_socket_path(self):
         cmd = ['sway', '--get-socketpath']
@@ -2071,6 +2170,8 @@ if __name__ == "__main__":
         reexec_self()
 
     display = Display(local_ip, listen_port)
+    # Start UDP state server so external processes (e.g., Daphne) can query Display
+    display.start_state_server()
 
     nwins = len(display.get_windows())
     if nwins > 0:
@@ -2131,6 +2232,12 @@ if __name__ == "__main__":
         for thread in threads:
             logging.info("Stopping thread")
             thread.join()
+
+        # Stop UDP state server
+        try:
+            display.stop_state_server()
+        except Exception:
+            pass
 
         logging.shutdown()
 
