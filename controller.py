@@ -2,7 +2,8 @@
 import requests
 import asyncio
 import configargparse
-from flask import Flask, send_file
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
 from hnapi import HnApi
 import html
 import json
@@ -26,15 +27,8 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
 import draw as view
 import wayland.protocol
-try:
-    from asgiref.wsgi import WsgiToAsgi
-except Exception:
-    WsgiToAsgi = None
-
-wserver = Flask(__name__)
-asgi_app = WsgiToAsgi(wserver) if WsgiToAsgi else None
-if asgi_app is None:
-    logging.warning("ASGI: 'asgiref' not installed. Install 'asgiref' to run via Daphne.")
+app = Starlette()
+asgi_app = app
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"clock":        "humanbeans_clock",
@@ -43,28 +37,32 @@ cmds = {"clock":        "humanbeans_clock",
         "screenshot":   "grim"}
 
 
-@wserver.route("/")
-def info():
-    return True
+@app.route("/", methods=["GET"])
+def web_main(request):
+    return HTMLResponse(HtmlPage.page_display())
+
+@app.route("/display", methods=["GET"])
+def web_display(request):
+    return HTMLResponse(HtmlPage.page_display())
 
 
 # Readiness
-@wserver.route('/healthy')
-def healthy():
-    return "OK"
+@app.route('/healthy', methods=["GET"]) 
+def healthy(request):
+    return PlainTextResponse("OK")
 
 
 # Liveness
-@wserver.route('/healthz')
-def healthz():
-    return probe_liveness()
+@app.route('/healthz', methods=["GET"]) 
+def healthz(request):
+    return PlainTextResponse(probe_liveness())
 
 
-@wserver.route("/screen")
-def screen():
+@app.route("/api/v1/display", methods=["GET"]) 
+def screen(request):
     state = Display.query_state()
     if not state:
-        return ("Service Unavailable", 503)
+        return PlainTextResponse("Service Unavailable", status_code=503)
     data = {
         "name": "display-0",
         "os_release": "iss-display",
@@ -76,15 +74,19 @@ def screen():
         "uris": globals().get('playlist').uris if 'playlist' in globals() else [],
         "streams": globals().get('stream').streams if 'stream' in globals() else [],
     }
-    return json.dumps(data)
+    return JSONResponse(data)
 
-@wserver.route("/screenshot")
-def display_screenshot():
+@app.route("/screenshot", methods=["GET"]) 
+def display_screenshot(request):
     fn = screenshot()
     if not os.path.exists(fn):
         logging.error("screenshot: File {} does not exist".format(fn))
-        return ("Not Found", 404)
-    return send_file(fn, mimetype='image/png')
+        return PlainTextResponse("Not Found", status_code=404)
+    return FileResponse(fn, media_type='image/png')
+
+@app.route("/api/v1/screenshot", methods=["GET"]) 
+def api_screenshot(request):
+    return display_screenshot(request)
 
 def probe_liveness():
     return "OK"
@@ -726,6 +728,7 @@ class Playlist:
         texts = list()
         texts.append(System.os_release())
         texts.append(System.uptime())
+        texts.append(f"Display started: {self.started}")
         texts.append(sys["uptime"])
         texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
         texts.append(sys["data"])
@@ -1452,6 +1455,7 @@ class Display:
         self.port = port
         self.res_x = res_x
         self.res_y = res_y
+        self.started = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
         self.start_time = time.time()
         self.switching_windows = list()
         self.window_blacklist = list()
@@ -1925,6 +1929,92 @@ class APOD:
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
             return None, None
+
+class HtmlPage:
+    @staticmethod
+    def show_display_data():
+        state = Display.query_state()
+        if not state:
+            return "<p>Display state unavailable</p>"
+
+        name = "display-0"
+        address = state.get('address')
+        port = state.get('port')
+        res_x = state.get('res_x')
+        res_y = state.get('res_y')
+
+        items = [
+            f"<li>Name: {html.escape(name)}</li>",
+            f"<li>Address: {html.escape(str(address))}</li>",
+            f"<li>Port: {html.escape(str(port))}</li>",
+            f"<li>Resolution: {html.escape(str(res_x))} x {html.escape(str(res_y))}</li>",
+        ]
+        return "<ul>" + "".join(items) + "</ul>"
+
+    @staticmethod
+    def show_playlist_data():
+        # Prefer global playlist created in __main__
+        pl_global = globals().get('playlist') if 'playlist' in globals() else None
+        playlist_items = pl_global.playlist if pl_global else None
+
+        # Fallback: build playlist via Playlist.create() using env URIs
+        if not playlist_items:
+            uris_env = os.environ.get('URI') or os.environ.get('URIS')
+            if uris_env:
+                # Split by common separators
+                for sep in ["\n", ",", ";"]:
+                    uris_env = uris_env.replace(sep, " ")
+                uris_list = [u.strip() for u in uris_env.split() if u.strip()]
+                try:
+                    tmp_pl = Playlist(uris_list, 5, Theme('default'), [], None)
+                    playlist_items = tmp_pl.create(uris_list)
+                except Exception:
+                    playlist_items = None
+
+        if not playlist_items:
+            return "<p>No playlist items available</p>"
+
+        table = [
+            "<table>",
+            "<thead><tr><th>#</th><th>URI</th><th>Player</th><th>Time (s)</th></tr></thead>",
+            "<tbody>",
+        ]
+        for item in playlist_items:
+            num = str(item.get('num', ''))
+            uri = str(item.get('uri', ''))
+            player = str(item.get('player', ''))
+            play_time_s = str(item.get('play_time_s', ''))
+            table.append(
+                f"<tr><td>{html.escape(num)}</td><td>{html.escape(uri)}</td><td>{html.escape(player)}</td><td>{html.escape(play_time_s)}</td></tr>"
+            )
+        table.append("</tbody>")
+        table.append("</table>")
+        return "".join(table)
+
+    @staticmethod
+    def page_display():
+        # Top screenshot image that refreshes via fetch
+        body = (
+            '<img id="screenshot" src="/api/v1/screenshot" alt="Screenshot" style="max-width:100%;" />'
+            '<script>'
+            'async function refreshScreenshot(){'
+            '  try {'
+            '    const res = await fetch("/api/v1/screenshot", {cache: "no-store"});'
+            '    if(!res.ok) return;'
+            '    const blob = await res.blob();'
+            '    const url = URL.createObjectURL(blob);'
+            '    const img = document.getElementById("screenshot");'
+            '    const old = img.src;'
+            '    img.src = url;'
+            '    if(old.startsWith("blob:")) { try { URL.revokeObjectURL(old); } catch(_){} }'
+            '  } catch(e) { /* ignore */ }'
+            '}'
+            'setInterval(refreshScreenshot, 1000);'
+            '</script>'
+        )
+        body += HtmlPage.show_display_data()
+        body += HtmlPage.show_playlist_data()
+        return "<html><head><title>ISS Display</title></head><body>" + body + "</body></html>"
 
 if __name__ == "__main__":
 
