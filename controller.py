@@ -24,8 +24,7 @@ import tempfile
 import time
 import threading
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
-sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
-import draw as view
+from wayland import draw as view
 import wayland.protocol
 
 # Ensure child processes inherit the runtime environment (including PATH)
