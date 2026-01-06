@@ -27,6 +27,11 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
 import draw as view
 import wayland.protocol
+
+# Ensure child processes inherit the runtime environment (including PATH)
+env = os.environ.copy()
+
+# Prepare ASGI app for API and web ui
 app = Starlette()
 asgi_app = app
 dependencies = []
@@ -47,18 +52,18 @@ def web_display(request):
 
 
 # Readiness
-@app.route('/healthy', methods=["GET"]) 
+@app.route('/healthy', methods=["GET"])
 def healthy(request):
     return PlainTextResponse("OK")
 
 
 # Liveness
-@app.route('/healthz', methods=["GET"]) 
+@app.route('/healthz', methods=["GET"])
 def healthz(request):
     return PlainTextResponse(probe_liveness())
 
 
-@app.route("/api/v1/display", methods=["GET"]) 
+@app.route("/api/v1/display", methods=["GET"])
 def screen(request):
     state = Display.query_state()
     if not state:
@@ -76,7 +81,7 @@ def screen(request):
     }
     return JSONResponse(data)
 
-@app.route("/screenshot", methods=["GET"]) 
+@app.route("/screenshot", methods=["GET"])
 def display_screenshot(request):
     fn = screenshot()
     if not os.path.exists(fn):
@@ -84,7 +89,7 @@ def display_screenshot(request):
         return PlainTextResponse("Not Found", status_code=404)
     return FileResponse(fn, media_type='image/png')
 
-@app.route("/api/v1/screenshot", methods=["GET"]) 
+@app.route("/api/v1/screenshot", methods=["GET"])
 def api_screenshot(request):
     return display_screenshot(request)
 
@@ -117,7 +122,7 @@ def list_routes(app_instance=None):
 
     return _walk(app_instance.routes)
 
-@app.route("/api/v1/routes", methods=["GET"]) 
+@app.route("/api/v1/routes", methods=["GET"])
 def api_routes(request):
     return JSONResponse(list_routes())
 
@@ -317,9 +322,10 @@ class System:
         cmd = ['ps', 'ux']
 
         ps = subprocess.Popen(cmd,
-                              stdout=subprocess.PIPE,
-                              shell=False,
-                              encoding="utf8").communicate()[0]
+                      stdout=subprocess.PIPE,
+                      shell=False,
+                      encoding="utf8",
+                      env=env).communicate()[0]
         return ps
 
     def os_release():
@@ -404,9 +410,10 @@ class System:
 
     def uptime():
         p = subprocess.Popen(['uptime'], shell=True,
-                                         stdout=subprocess.PIPE,
-                                         stderr=subprocess.STDOUT,
-                                         encoding="utf8")
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT,
+                         encoding="utf8",
+                         env=env)
         output, error = p.communicate()
         return output.strip()
 
@@ -653,13 +660,20 @@ class Playlist:
         draw_apod('wayland-view', center=center, img_bg=img_bg)
 
     def start_browser(self, urls):
-        cmd = ['webdriver_util.py']
+        cmd = [sys.executable, '-m', 'webdriver_util']
         for url in urls:
             cmd.append("--url")
             cmd.append(url)
 
+        # Disable Selenium Manager and provide explicit driver/browser paths
+        env_mod = env.copy()
+        env_mod['SE_DISABLE_DRIVER_MANAGEMENT'] = '1'
+        env_mod['GECKODRIVER'] = env_mod.get('GECKODRIVER', '/usr/bin/geckodriver')
+        env_mod['FIREFOX_BIN'] = env_mod.get('FIREFOX_BIN', '/usr/bin/firefox')
+
         Popen(cmd,
-              env=env,
+              env=env_mod,
+              shell=False,
               start_new_session=True,
               close_fds=True,
               encoding='utf8')
@@ -945,7 +959,7 @@ class Stream():
                 '!', 'oggmux',
                 '!', 'tcpserversink', 'host=' + ip + '',
                 'port=' + str(port) + ''
-                ], stdin=subprocess.PIPE)
+                ], stdin=subprocess.PIPE, env=env)
 
         elif stream_source == "v4l2":
             gstreamer = subprocess.Popen([
@@ -956,7 +970,7 @@ class Stream():
                 '!', 'queue',
                 '!', 'tcpserversink', 'host=' + ip + '',
                 'port=' + str(port) + ''
-                ], stdin=subprocess.PIPE)
+                ], stdin=subprocess.PIPE, env=env)
 
         return gstreamer
 
@@ -1009,7 +1023,8 @@ class Stream():
                     stdin=subprocess.PIPE,
                     start_new_session=True,
                     close_fds=False,
-                    encoding='utf8')
+                encoding='utf8',
+                env=env)
 
         # Handle wf-recorder prompt for overwriting the file
         p.stdin.write('Y\n')
@@ -1022,7 +1037,7 @@ class Stream():
             'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
             '-codec', 'copy',
             '-f', 'mpegts', 'udp:0.0.0.0:6000'
-            ])
+            ], env=env)
 
 
 class Music:
@@ -1263,7 +1278,8 @@ whatismyip {
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            encoding='utf8'
+            encoding='utf8',
+            env = {'PATH': '/venv/bin:/usr/local/bin:/usr/bin:/bin'}
         )
         stdout, stderr = p.communicate()
         logging.info(f"py3status ({self.module_name}):\n{stdout}")
@@ -1610,10 +1626,11 @@ class Display:
     def get_socket_path(self):
         cmd = ['sway', '--get-socketpath']
         p = subprocess.Popen(cmd,
-                             shell=False,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
-                             encoding="utf8")
+                     shell=False,
+                     stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT,
+                     encoding="utf8",
+                     env=env)
 
         path = p.communicate()
         path = path[0].rstrip()
@@ -1631,9 +1648,10 @@ class Display:
         windows = []
 
         p = subprocess.Popen(cmd,
-                             shell=True,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+                     shell=True,
+                     stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE,
+                     env=env)
 
         data = json.loads(p.communicate()[0])
 
@@ -1697,7 +1715,7 @@ class Display:
                          .format(next_window["id"]))
             cmd = "swaymsg -s {} [con_id={}] focus"\
                   .format(self.socket_path, next_window["id"])
-            p = subprocess.Popen(cmd, shell=True)
+            p = subprocess.Popen(cmd, shell=True, env=env)
             p.communicate()[0]
 
     async def fullscreen_next_window(self):
@@ -1720,7 +1738,8 @@ class Display:
               .format(self.socket_path, next_window["id"])
 
         p = subprocess.Popen(cmd,
-                             shell=True)
+                     shell=True,
+                     env=env)
 
         p.communicate()[0]
 
@@ -1737,8 +1756,9 @@ class Display:
         cmd = "swaymsg -s {} workspace {}".format(self.socket_path, ws)
 
         p = subprocess.Popen(cmd,
-                             shell=True,
-                             encoding="utf8")
+                     shell=True,
+                     encoding="utf8",
+                     env=env)
 
         res = p.communicate()[0]
 
@@ -2293,6 +2313,7 @@ if __name__ == "__main__":
         reexec_self()
 
     display = Display(local_ip, listen_port)
+
     # Start UDP state server so external processes (e.g., Daphne) can query Display
     display.start_state_server()
 
@@ -2302,6 +2323,7 @@ if __name__ == "__main__":
                         .format(nwins))
 
     theme = Theme(theme_name)
+    logging.info(f"PATH: {env.get('PATH', '')}")
     logging.info("Using theme: {}".format(theme_name))
     logging.info("URIs: {}".format(uris))
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
@@ -2311,7 +2333,7 @@ if __name__ == "__main__":
     expected = len(playlist.playlist)
     logging.info("Started {} {}".format(started, "player" if started == 1 else "players"))
     if expected != started:
-        logging.info("Players started mismatch: expected {} from URIs, started {}".format(expected, started))
+        logging.info("Player mismatch: expected {} from URIs, started {}".format(expected, started))
     iss = Iss(threads)
 
     stream = Stream(stream_source)
@@ -2374,13 +2396,15 @@ if __name__ == "__main__":
 
     # Start ASGI server via Daphne
     try:
-        cmd = ['/home/swayvnc/venv/bin/daphne', '-b', listen_address, '-p', str(listen_port), 'controller:asgi_app']
+        cmd = ['daphne', '-b', listen_address, '-p', str(listen_port), 'controller:asgi_app']
         logging.info("Starting Daphne ASGI server on %s:%s" % (listen_address, listen_port))
         # Ensure the controller directory is importable so Daphne can import 'controller:asgi_app'
         module_dir = os.path.dirname(os.path.abspath(__file__))
         env_mod = os.environ.copy()
         env_mod['PYTHONPATH'] = module_dir + (os.pathsep + env_mod['PYTHONPATH'] if 'PYTHONPATH' in env_mod else '')
         subprocess.run(cmd, env=env_mod)
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run(cmd, env=env, shell=True)
     except FileNotFoundError:
         logging.error("Daphne not found. Install 'daphne' to run the ASGI server.")
         sys.exit(1)
