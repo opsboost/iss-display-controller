@@ -29,4 +29,4 @@ RUN apk add --no-cache python3
 COPY --from=build-venv /venv /venv
 COPY . /controller
 WORKDIR /controller
-ENTRYPOINT ["/venv/bin/python3", "controller"]
+ENTRYPOINT ["/venv/bin/python3", "/controller/controller.py"]
