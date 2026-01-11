@@ -2,23 +2,27 @@
 import requests
 import asyncio
 import configargparse
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
 from hnapi import HnApi
 import html
+import ipaddress
 import json
 import logging
 from logging import DEBUG
 import os
 from paho.mqtt import client as mqtt_client
 from pathlib import Path
+import platform
 import random
+import re
 import socket
 import stat
 import subprocess
 from subprocess import Popen, PIPE
+import shutil
 import signal
 import sqlite3
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
 import sys
 import tempfile
 import time
@@ -41,34 +45,34 @@ cmds = {"clock":        "humanbeans_clock",
         "screenshot":   "grim"}
 
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET"], name="web_main")
 def web_main(request):
     return HTMLResponse(HtmlPage.page_display())
 
-@app.route("/display", methods=["GET"])
+@app.route("/display", methods=["GET"], name="web_display")
 def web_display(request):
     return HTMLResponse(HtmlPage.page_display())
 
 
 # Readiness
-@app.route('/healthy', methods=["GET"])
+@app.route('/healthy', methods=["GET"], name="healthy")
 def healthy(request):
     return PlainTextResponse("OK")
 
 
 # Liveness
-@app.route('/healthz', methods=["GET"])
+@app.route('/healthz', methods=["GET"], name="healthz")
 def healthz(request):
     return PlainTextResponse(probe_liveness())
 
 
-@app.route("/api/v1/display", methods=["GET"])
+@app.route("/api/v1/display", methods=["GET"], name="api_display")
 def screen(request):
     state = Display.query_state()
     if not state:
         return PlainTextResponse("Service Unavailable", status_code=503)
     data = {
-        "name": "display-0",
+        "name": socket.gethostname(),
         "os_release": "iss-display",
         "listen_address": state.get('address'),
         "listen_port": state.get('port'),
@@ -80,15 +84,15 @@ def screen(request):
     }
     return JSONResponse(data)
 
-@app.route("/screenshot", methods=["GET"])
+@app.route("/screenshot", methods=["GET"], name="screenshot")
 def display_screenshot(request):
     fn = screenshot()
-    if not os.path.exists(fn):
-        logging.error("screenshot: File {} does not exist".format(fn))
+    if not fn or not os.path.exists(fn):
+        logging.error(f"screenshot: capture failed or file does not exist")
         return PlainTextResponse("Not Found", status_code=404)
     return FileResponse(fn, media_type='image/png')
 
-@app.route("/api/v1/screenshot", methods=["GET"])
+@app.route("/api/v1/screenshot", methods=["GET"], name="api_screenshot")
 def api_screenshot(request):
     return display_screenshot(request)
 
@@ -121,7 +125,7 @@ def list_routes(app_instance=None):
 
     return _walk(app_instance.routes)
 
-@app.route("/api/v1/routes", methods=["GET"])
+@app.route("/api/v1/routes", methods=["GET"], name="api_routes")
 def api_routes(request):
     return JSONResponse(list_routes())
 
@@ -130,11 +134,11 @@ def probe_liveness():
 
 
 def which(cmd):
-    def is_exe(fpath):
-        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+    """Return absolute path to executable or None if not found."""
+    return shutil.which(cmd)
 
 def download_file(url, path, use_curl=True):
-    logging.info("Downloading: " + url)
+    logging.info(f"Downloading: {url}")
 
     if not use_curl:
         # Use requests to download
@@ -144,13 +148,12 @@ def download_file(url, path, use_curl=True):
            file.write(response.content)
 
     else:
-        cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
+          cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
 
-        Popen(cmd,
+          Popen(cmd,
               env=env,
               start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
+              close_fds=True)
 
     return True
 
@@ -205,7 +208,9 @@ def draw_apod(output='terminal', center=False, img_bg=False):
         center (bool): Center the APOD in the terminal (only for terminal output).
         img_bg (bool): Use an image background if available.
     """
-    apod = APOD()
+    # Use configured API key if available
+    key = globals().get('apod_api_key') or os.environ.get('APOD_API_KEY') or 'DEMO_KEY'
+    apod = APOD(api_key=key)
     img_path, desc = apod.apod_data()
     if not img_path or not desc:
         logging.error("Failed to fetch APOD data.")
@@ -214,10 +219,10 @@ def draw_apod(output='terminal', center=False, img_bg=False):
     if output == 'terminal':
         print(desc)
     elif output == 'wayland-view':
-        view = Wayland_view(display.res_x, display.res_y, 1, theme)
-        view.s_objects[0]["font_size"] = 20
-        view.s_objects[0]["alignment"] = "left"
-        view.show_image(img_path)
+        wv = Wayland_view(display.res_x, display.res_y, 1, theme)
+        wv.s_objects[0]["font_size"] = 20
+        wv.s_objects[0]["alignment"] = "left"
+        wv.show_image(img_path)
 
 def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False):
     """
@@ -230,7 +235,6 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
     import calendar
     import datetime
     import re
-    import shutil
 
     today = datetime.date.today()
     cal = calendar.TextCalendar(calendar.MONDAY)
@@ -250,12 +254,9 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
                 font_size = 20
                 font_face_hilight = "Monospace"
                 font_size_hilight = 23
-                markup = "</span><span foreground=\"orange\" font=\"{} {}\">{}</span><span foreground=\"white\" font=\"{} {}\">".format(
-                    font_face_hilight,
-                    font_size_hilight,
-                    match.group(0),
-                    font_face,
-                    font_size
+                markup = (
+                    f"</span><span foreground=\"orange\" font=\"{font_face_hilight} {font_size_hilight}\">{match.group(0)}</span>"
+                    f"<span foreground=\"white\" font=\"{font_face} {font_size}\">"
                 )
                 return markup
 
@@ -314,45 +315,64 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
 class System:
 
     def list_processes(limit=0):
-        # Processes without kernel threads
-        cmd = ['ps', 'wux', '--ppid', '2', '-p', '2', '--deselect']
+        # Choose ps variant by platform
+        system = platform.system()
+        if system == 'Linux':
+            # Processes without kernel threads
+            cmd = ['ps', 'wux', '--ppid', '2', '-p', '2', '--deselect']
+        elif system in ('Darwin', 'FreeBSD'):
+            cmd = ['ps', 'aux']
+        else:
+            cmd = ['ps', 'aux']
 
-        # FreeBSD
-        cmd = ['ps', 'ux']
-
-        ps = subprocess.Popen(cmd,
-                      stdout=subprocess.PIPE,
-                      shell=False,
-                      encoding="utf8",
-                      env=env).communicate()[0]
+        try:
+            ps = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                shell=False,
+                encoding="utf8",
+                env=env
+            ).communicate()[0]
+        except Exception as e:
+            logging.error(f"ps failed: {e}")
+            ps = ""
+        if limit and ps:
+            lines = ps.splitlines()
+            return "\n".join(lines[:max(0, limit)])
         return ps
 
     def os_release():
         data = ""
-        f = open('/etc/os-release')
-        for line in skip_comments(f):
-            if line.startswith("PRETTY_NAME"):
-                data += line.split("=")[1].strip('"')
-
+        try:
+            with open('/etc/os-release', encoding='utf-8') as f:
+                for line in skip_comments(f):
+                    if line.startswith("PRETTY_NAME"):
+                        data = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except FileNotFoundError:
+            logging.warning("/etc/os-release not found")
+        except Exception as e:
+            logging.error(f"Failed reading /etc/os-release: {e}")
         return data
 
     def sys_data():
         sys = {"data" : None,
                "uptime" : ""}
         sysdata = Py3status("sysdata")
-        sys["data"] = sysdata.run_module()
+        data = sysdata.run_module()
+        sys["data"] = data
         uptime = Py3status("uptime")
         sys["uptime"] = uptime.run_module()
 
         return sys
 
-    def net_data(probe_ip):
+    def net_data(probe_ip_address):
         net = {"address" : None,
                "addresses" : "",
                "public_ip" : "",
                "online_status" : "",
                "resolvconf" : ""}
-        net["address"] = System.net_iface_address(probe_ip)
+        net["address"] = System.net_iface_address(probe_ip_address)
         net_iplist = Py3status("net_iplist")
         net["addresses"] = net_iplist.run_module()
         whatismyip = Py3status("whatismyip")
@@ -365,47 +385,44 @@ class System:
 
     def net_resolvconf():
         data = ""
-        f = open('/etc/resolv.conf')
-        for line in skip_comments(f):
-            data += line + "\n"
+        try:
+            with open('/etc/resolv.conf', encoding='utf-8') as f:
+                for line in skip_comments(f):
+                    data += line + "\n"
+        except FileNotFoundError:
+            logging.warning("/etc/resolv.conf not found")
+        except Exception as e:
+            logging.error(f"Failed reading /etc/resolv.conf: {e}")
         return data
 
     def net_valid_ip_address(ip_address):
         try:
-            socket.inet_pton(socket.AF_INET, ip_address)
-        except:
-            try:
-                socket.inet_pton(socket.AF_INET6, address)
-            except:
-                logging.warning('%s is an invalid IP address' % (ip_address))
-                return False
-
-        return True
+            ipaddress.ip_address(ip_address)
+            return True
+        except ValueError:
+            logging.warning(f"{ip_address} is an invalid IP address")
+            return False
 
     def net_iface_address(ip_address):
-        ip_address = "9.9.9.9"
-
         try:
-            socket.inet_pton(socket.AF_INET6, ip_address)
-            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        except:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                socket.inet_pton(socket.AF_INET, ip_address)
-            except:
-                logging.warning('%s is an invalid IP address' % (ip_address))
-                return False
+            ip_obj = ipaddress.ip_address(ip_address)
+        except ValueError:
+            logging.warning(f"{ip_address} is an invalid IP address")
+            return False
 
+        family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
         try:
-            s.connect((ip_address, 80))
-        except OSError as e:
-            if e.errno == 51:
-                logging.info("%s is unreachable", ip_address)
-                return False
-            else:
-                raise
-
-        return s.getsockname()[0]
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
+                s.settimeout(0.5)
+                try:
+                    s.connect((ip_address, 80))
+                except OSError as e:
+                    logging.info(f"{ip_address} is unreachable or no route: {e}")
+                    return False
+                return s.getsockname()[0]
+        except Exception as e:
+            logging.error(f"Failed to determine local address for {ip_address}: {e}")
+            return False
 
     def uptime():
         p = subprocess.Popen(['uptime'], shell=True,
@@ -427,18 +444,27 @@ class Zeroconf_service:
                  listen_port,
                  properties):
 
-        ip_version = IPVersion.V6Only
+        # Support both IPv4/IPv6; pack address according to the provided address
+        ip_version = IPVersion.All
         self.service_type = service_type
         self.service_name = name_prefix + "-" + \
             hostname + "." + \
             self.service_type
 
         # The zeroconf service data to publish on the network
+        try:
+            addr_obj = ipaddress.ip_address(listen_address)
+            af = socket.AF_INET6 if addr_obj.version == 6 else socket.AF_INET
+            packed = socket.inet_pton(af, listen_address)
+            addrs = [packed]
+        except Exception:
+            logging.warning(f"zeroconf: invalid listen_address '{listen_address}', defaulting to 127.0.0.1")
+            addrs = [socket.inet_pton(socket.AF_INET, '127.0.0.1')]
+
         self.zc_service = ServiceInfo(
             self.service_type,
             self.service_name,
-            addresses=[socket.inet_pton(socket.AF_INET,
-                                        listen_address)],
+            addresses=addrs,
             port=int(listen_port),
             properties=properties,
             server=hostname + ".local.",
@@ -484,7 +510,7 @@ class Playlist:
         self.default_play_time_s = default_play_time_s
         self.news = None
         self.theme = theme
-        self.topics = topics
+        self.topics = topics or []
 
         self.playlist = list()
         self.playlist = self.create(uris)
@@ -588,12 +614,12 @@ class Playlist:
         return playlist
 
     def get_uris(self):
+        uris = []
         for item in self.playlist:
             uris.append(item["uri"])
-
         return uris
 
-    def start_player(self, probe_ip):
+    def start_player(self, probe_ip_address):
         threads = list()
         for item in self.playlist:
             if item["player"] == "apod":
@@ -625,7 +651,7 @@ class Playlist:
             elif item["player"] == "network":
                 x = threading.Thread(target=self.start_net_view,
                                      args=(self.theme.img_bg,
-                                           probe_ip))
+                                           probe_ip_address))
             elif item["player"] == "news":
                 x = threading.Thread(target=self.start_news_view,
                                      args=(self.news,
@@ -640,7 +666,7 @@ class Playlist:
             elif item["player"] == "system":
                 x = threading.Thread(target=self.start_sys_view,
                                      args=(self.theme.img_bg,
-                                           probe_ip))
+                                           probe_ip_address))
             elif item["player"] == "weather":
                 x = threading.Thread(target=self.start_weather_view,
                                      args=(self.weather,
@@ -648,7 +674,7 @@ class Playlist:
 
             x.start()
             if not x.is_alive():
-                logging.error("Failed to start {}".format(item["player"]))
+                logging.error(f"Failed to start {item['player']}")
             else:
                 threads.append(x)
 
@@ -687,25 +713,24 @@ class Playlist:
         logging.info("Starting clock")
         cmd = [cmds["clock"]]
 
-        p = Popen(cmd,
+        try:
+            Popen(cmd,
                   env=env,
                   start_new_session=True,
                   close_fds=True)
-
-        if p.communicate()[0] != 0:
+            return True
+        except Exception as e:
+            logging.error(f"Clock start failed: {e}")
             return False
 
-        return True
-
     def start_image_viewer(self, file):
-        logging.info("Starting image viewer with file: " + file)
+        logging.info(f"Starting image viewer with file: {file}")
         cmd = [cmds["image_viewer"],  file]
 
         Popen(cmd,
               env=env,
               start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
+              close_fds=True)
 
         return True
 
@@ -716,6 +741,9 @@ class Playlist:
                     mqtt_port,
                     mqtt_user,
                     mqtt_pw)
+        if not topics:
+            logging.info("MQTT: No topics configured; skipping MQTT view subscriptions")
+            return False
         try:
             mqttc = mqtt.connect()
         except Exception:
@@ -724,12 +752,12 @@ class Playlist:
 
         for topic in topics:
             mqtt.subscribe(mqttc, topic, theme)
-            logging.info("MQTT: Subscribed to {}".format(topic))
+            logging.info(f"MQTT: Subscribed to {topic}")
 
         mqttc.loop_forever()
 
     def start_mediaplayer(self, url):
-        logging.info("Starting media player with stream: " + url)
+        logging.info(f"Starting media player with stream: {url}")
         cmd = [cmds["media_player"],  url]
 
         Popen(cmd,
@@ -740,10 +768,10 @@ class Playlist:
 
         return True
 
-    def start_net_view(self, img_bg, probe_ip):
+    def start_net_view(self, img_bg, probe_ip_address):
         logging.info("Starting network view")
         texts = list()
-        net = System.net_data(probe_ip)
+        net = System.net_data(probe_ip_address)
         texts.append(net["address"])
         texts.append(net["addresses"])
         texts.append(net["public_ip"])
@@ -767,9 +795,9 @@ class Playlist:
         view.s_objects[0]["alignment"] = "left"
         view.show_text(texts, img_bg)
 
-    def start_sys_view(self, img_bg, probe_ip):
+    def start_sys_view(self, img_bg, probe_ip_address):
         logging.info("Starting sys view")
-        net = System.net_data(probe_ip)
+        net = System.net_data(probe_ip_address)
         sys = System.sys_data()
         texts = list()
         texts.append(System.os_release())
@@ -808,32 +836,40 @@ class Playlist:
         texts = list()
         data, icon = weather.current_weather()
 
-        if not icon:
-            logging.debug(f"weather: No icon found for current condition")
-        else:
+        if icon:
             texts.append(icon)
 
-        texts.append(data["current_condition"][0]["temp_C"] + "°C")
-        texts.append(data["current_condition"][0]["weatherDesc"][0]["value"]
-                     + " " +
-                     data["current_condition"][0]["windspeedKmph"] + " km/h")
-        texts.append(data["nearest_area"][0]["areaName"][0]["value"])
-
-        # Add dawn and sunset for today
-        dawn_sunset_times = dawn_sunset(location=weather.location)
-        if not dawn_sunset_times:
-            logging.info(f"No dawn/sunset data returned for location: {weather.location}")
-        elif "today" not in dawn_sunset_times:
-            logging.info(f"'today' key missing in dawn/sunset data for location: {weather.location}: {dawn_sunset_times}")
+        if not data:
+            texts.append("Weather data unavailable")
         else:
-            dawn = dawn_sunset_times["today"].get("dawn")
-            sunset = dawn_sunset_times["today"].get("sunset")
-            if not dawn:
-                logging.info(f"No 'dawn' value in dawn/sunset data for location: {weather.location}: {dawn_sunset_times['today']}")
+            try:
+                texts.append(data["current_condition"][0]["temp_C"] + "°C")
+                texts.append(
+                    data["current_condition"][0]["weatherDesc"][0]["value"]
+                    + " "
+                    + data["current_condition"][0]["windspeedKmph"]
+                    + " km/h"
+                )
+                texts.append(data["nearest_area"][0]["areaName"][0]["value"])
+            except Exception as e:
+                logging.error(f"weather: Unexpected data format: {e}")
+                texts.append("Weather data unavailable")
+
+        # Add sunrise and sunset for today
+        sunrise_sunset_times = sunrise_sunset(location=weather.location)
+        if not sunrise_sunset_times:
+            logging.info(f"No sunrise/sunset data returned for location: {weather.location}")
+        elif "today" not in sunrise_sunset_times:
+            logging.info(f"'today' key missing in sunrise/sunset data for location: {weather.location}: {sunrise_sunset_times}")
+        else:
+            sunrise = sunrise_sunset_times["today"].get("sunrise")
+            sunset = sunrise_sunset_times["today"].get("sunset")
+            if not sunrise:
+                logging.info(f"No 'sunrise' value in sunrise/sunset data for location: {weather.location}: {sunrise_sunset_times['today']}")
             if not sunset:
-                logging.info(f"No 'sunset' value in dawn/sunset data for location: {weather.location}: {dawn_sunset_times['today']}")
-            if dawn and sunset:
-                texts.append(f"Dawn: {dawn}  Sunset: {sunset}")
+                logging.info(f"No 'sunset' value in sunrise/sunset data for location: {weather.location}: {sunrise_sunset_times['today']}")
+            if sunrise and sunset:
+                texts.append(f"Sunrise: {sunrise}  Sunset: {sunset}")
 
         # Add a margin (empty line) between location and moon data
         texts.append("")
@@ -884,13 +920,17 @@ class Playlist:
     def start_news_view(self, news, img_bg):
         texts = list()
         item = news.news_item()
-        texts.append(item["feed"])
-        texts.append(item["title"])
-        texts.append(item["url"])
+        if not item:
+            texts.append("No news available")
+        else:
+            texts.append(item.get("feed", ""))
+            texts.append(item.get("title", ""))
+            texts.append(item.get("url", ""))
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 30
         view.s_objects[1]["font_size"] = 60
-        view.s_objects[2]["font_size"] = 30
+        if len(texts) > 2:
+            view.s_objects[2]["font_size"] = 30
         view.show_text(texts, img_bg)
 
     def start_onthisday_view(self, otd, img_bg):
@@ -982,7 +1022,7 @@ class Stream():
             filename = '/tmp/screenshot.png'
             t1 = int(round(time.time() * 1000))
 
-            logging.debug(filename + ": " + str(t1 - t0) + " ms")
+            logging.debug(f"{filename}: {t1 - t0} ms")
 
             t0 = t1
 
@@ -1009,11 +1049,11 @@ class Stream():
     def stream_create_v4l2_src(self, device):
         # Check if device is an existing character device
         if not stat.S_ISCHR(os.lstat(device)[stat.ST_MODE]):
-            logging.error(device + " does not exist, aborting..")
+            logging.error(f"{device} does not exist, aborting..")
             sys.exit(1)
 
         # Create v4l2 recording of screen
-        logging.info("Creating v4l2 stream with device: " + device)
+        logging.info(f"Creating v4l2 stream with device: {device}")
         p = subprocess.Popen([
                     'wf-recorder',
                     '--muxer=v4l2',
@@ -1051,7 +1091,7 @@ class Music:
     def mpd(self):
         mpd = Py3status("mpd")
         data = mpd.run_module()
-        print(data)
+        return data
 
 
 class MQTT:
@@ -1065,14 +1105,25 @@ class MQTT:
         self.mqtt_views = list()
 
     def connect(self):
-        def on_connect(client, userdata, flags, r):
-            if r == 0:
+        # paho-mqtt v2 callback signature support
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            if reason_code == 0:
                 logging.info("MQTT: Connected")
             else:
-                logging.error("MQTT: Failed to connect: %d\n", r)
+                logging.error(f"MQTT: Failed to connect: {reason_code}")
 
-        # Set client ID
-        client = mqtt_client.Client(self.client_id)
+        # Set client ID with v2 callback API when available
+        try:
+            if hasattr(mqtt_client, 'CallbackAPIVersion'):
+                client = mqtt_client.Client(
+                    client_id=self.client_id,
+                    callback_api_version=mqtt_client.CallbackAPIVersion.V2
+                )
+            else:
+                client = mqtt_client.Client(self.client_id)
+        except TypeError:
+            # Fallback for older client signatures
+            client = mqtt_client.Client(self.client_id)
 
         if self.user != "" and self.pw != "":
             client.username_pw_set(self.user, self.pw)
@@ -1086,32 +1137,65 @@ class MQTT:
 
         def on_message(client, userdata, msg):
             self.active_msg = ""
-            jm = msg.payload.decode()
-            m = json.loads(jm)
-            logging.info(f"Received `{m}` in  `{msg.topic}`")
-            texts = list()
+            try:
+                jm = msg.payload.decode(errors='ignore')
+            except Exception:
+                jm = ""
 
-            if msg.topic == "hyperblast/current_song":
-                texts.append(m["title"])
-                texts.append("[" + m["file"] + "]")
-            elif msg.topic == "sensor/mainhallsensor/temperature":
-                texts.append("Mainhall")
-                texts.append(str(m) + " °C")
+            # Try JSON parse, fall back to raw text
+            try:
+                m = json.loads(jm)
+            except Exception:
+                m = None
+
+            logging.info(f"Received `{m if m is not None else jm}` in  `{msg.topic}`")
+            texts = []
+
+            topic = msg.topic or ""
+            if isinstance(m, dict):
+                if topic == "hyperblast/current_song":
+                    title = m.get("title") or ""
+                    file_name = m.get("file") or ""
+                    if title:
+                        texts.append(title)
+                    if file_name:
+                        texts.append(f"[{file_name}]")
+                elif topic == "sensor/mainhallsensor/temperature":
+                    texts.append("Mainhall")
+                    val = m.get("value") if isinstance(m.get("value"), (int, float, str)) else m
+                    texts.append(f"{val} °C")
+                else:
+                    # Generic dict payload
+                    texts.append(json.dumps(m))
+            elif m is not None:
+                # JSON but not dict (e.g. list/number/string)
+                texts.append(json.dumps(m))
+            else:
+                # Not JSON, raw text
+                if jm:
+                    texts.append(jm)
+
+            if not texts:
+                texts = [str(jm)]
 
             view = Wayland_view(display.res_x,
                                 display.res_y,
                                 len(texts),
                                 self.theme)
 
-            view.s_objects[0]["font_size"] = 64
-            view.s_objects[0]["alignment"] = "center"
-            view.s_objects[1]["font_size"] = 48
-            view.s_objects[1]["alignment"] = "center"
-            view.show_text(texts, theme["img_bg"])
+            for i in range(len(texts)):
+                if i == 0:
+                    view.s_objects[i]["font_size"] = 64
+                    view.s_objects[i]["alignment"] = "center"
+                else:
+                    view.s_objects[i]["font_size"] = 48
+                    view.s_objects[i]["alignment"] = "center"
+            view.show_text(texts, self.theme.img_bg)
             self.mqtt_views.append(msg.topic)
 
         client.subscribe(topic)
-        client.on_message = on_message
+        # Register per-topic callback without clobbering global on_message
+        client.message_callback_add(topic, on_message)
 
 
 class OTD:
@@ -1124,15 +1208,17 @@ class OTD:
         url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{month}/{day}"
         self.events = []
 
-        response = requests.get(url)
-
-        if response.status_code == 200:
-            data = response.json()
-            for event in data.get("events", []):
-                logging.info(f"{event['year']}: {event['text']}")
-                self.events.append(event)
-        else:
-            logging.error("Failed to fetch otd data")
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                for event in data.get("events", []):
+                    logging.info(f"{event['year']}: {event['text']}")
+                    self.events.append(event)
+            else:
+                logging.error(f"Failed to fetch otd data: HTTP {response.status_code}")
+        except Exception as e:
+            logging.error(f"Failed to fetch otd data: {e}")
 
     def otd_item(self):
         n = {"year": "",
@@ -1159,12 +1245,18 @@ class News:
         n = {"feed": "",
              "title": "",
              "url": ""}
-
-        n["feed"] = self.news[0].get('feed')
-        n["title"] = self.news[0].get('title')
-        n["url"] = self.news[0].get('url')
-        self.news.pop(0)
-
+        if not self.news:
+            return None
+        try:
+            n["feed"] = self.news[0].get('feed')
+            n["title"] = self.news[0].get('title')
+            n["url"] = self.news[0].get('url')
+        finally:
+            # Remove the item even if some keys are missing
+            try:
+                self.news.pop(0)
+            except Exception:
+                pass
         return n
 
     def sqlite_select(self, db, query):
@@ -1172,18 +1264,24 @@ class News:
              "url": ""}
 
         if not os.path.exists(db):
-            logging.error("News: Database does not exist %s", db)
+            logging.error(f"News: Database does not exist {db}")
             return False
 
-        con = sqlite3.connect(db)
-        cur = con.cursor()
-        res = cur.execute(query)
-        r = res.fetchall()
-        for news in r:
-            logging.info("News: Appending news")
-            self.news.append({"feed"  : news[0],
-                              "title" : news[1],
-                              "url"   : news[2]})
+        try:
+            with sqlite3.connect(db) as con:
+                cur = con.cursor()
+                res = cur.execute(query)
+                r = res.fetchall()
+                for news in r:
+                    logging.info("News: Appending news")
+                    self.news.append({
+                        "feed": news[0],
+                        "title": news[1],
+                        "url": news[2]
+                    })
+        except Exception as e:
+            logging.error(f"News: sqlite error: {e}")
+            return False
 
     def hn_fetch_top_news(self, nitems):
         n = 0
@@ -1273,12 +1371,18 @@ whatismyip {
             except Exception as e:
                 logging.warning(f"py3status: failed reading config content: {e}")
 
+        # Inherit current env PATH, optionally prepend /venv/bin if present
+        env_run = os.environ.copy()
+        venv_bin = '/venv/bin'
+        if os.path.isdir(venv_bin):
+            env_run['PATH'] = venv_bin + (os.pathsep + env_run['PATH'] if 'PATH' in env_run else '')
+
         p = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             encoding='utf8',
-            env = {'PATH': '/venv/bin:/usr/local/bin:/usr/bin:/bin'}
+            env=env_run
         )
         stdout, stderr = p.communicate()
         logging.info(f"py3status ({self.module_name}):\n{stdout}")
@@ -1339,9 +1443,8 @@ class Weather:
         self.weather = self.fetch_weather()
 
     def fetch_weather(self):
-        url = "https://wttr.in/{}?format=j1".format(self.location)
-        logging.info("iss-weather: Fetching weather for {} at {}"
-                     .format(self.location, url))
+        url = f"https://wttr.in/{self.location}?format=j1"
+        logging.info(f"iss-weather: Fetching weather for {self.location} at {url}")
         data = None
         icon = None
         try:
@@ -1358,9 +1461,9 @@ class Weather:
             else:
                 logging.error("Failed to fetch weather data: empty response")
         except requests.ReadTimeout as e:
-            logging.error("weather: Timeout for request {}".format(e))
+            logging.error(f"weather: Timeout for request {e}")
         except Exception as e:
-            logging.error("weather: Error requesting weather: {}".format(e))
+            logging.error(f"weather: Error requesting weather: {e}")
         return data, icon
 
     def icon(self, condition):
@@ -1452,18 +1555,18 @@ class Wayland_view:
         w.close()
         self.conn.display.roundtrip()
         self.conn.disconnect()
-        logging.info("Exiting wayland view: {}".format(view.shutdowncode))
+        logging.info(f"Exiting wayland view: {view.shutdowncode}")
 
     def show_text(self, texts, img_bg=False, fullscreen=False, html_escape=True):
-        logging.info("view: Have {} text block(s)".format(len(texts)))
+        logging.info(f"view: Have {len(texts)} text block(s)")
 
         n = 0
         for text in texts:
             logging.debug(f"Showing text: {text}")
             if html_escape:
-                self.s_objects[n]["text"] = html.escape(str(text).replace("&", "&amp;"))
+                self.s_objects[n]["text"] = html.escape(str(text))
             else:
-                self.s_objects[n]["text"] = str(text).replace("&", "&amp;")
+                self.s_objects[n]["text"] = str(text)
             n += 1
 
         if img_bg:
@@ -1482,14 +1585,14 @@ class Wayland_view:
         self.create_window(w)
 
     def show_image(self, img_file, fullscreen=False):
-        self.s_objects[0]["texts"] = list()
+        self.s_objects[0]["text"] = list()
         self.s_objects[0]["file"] = img_file
         self.s_objects[0]["bg_alpha"] = 0
         self.s_objects[0]["offset_y"] = 0
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=draw_function,
+                        redraw=view.draw_image,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -1524,12 +1627,19 @@ class Display:
         # so we put their IDs on a blacklist
         # This is usually only useful in development/testing scenarios
         # e.g. when run locally with an existing sway session
-        existing_windows = self.get_windows()
+        existing_windows = []
+        try:
+            existing_windows = self.get_windows()
+        except Exception as e:
+            logging.warning(f"display: Failed to get existing windows; sway may be unavailable: {e}")
+            existing_windows = []
         for win in existing_windows:
-            self.window_blacklist.append(win["id"])
+            try:
+                self.window_blacklist.append(win["id"])
+            except Exception:
+                pass
 
-        logging.info("Blacklisted {} windows"
-                     .format(len(self.window_blacklist)))
+        logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
@@ -1552,8 +1662,29 @@ class Display:
         self._state_server_stop.set()
         # Kick the socket to unblock if waiting
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(b"STOP", (self.state_udp_host, self.state_udp_port))
+            target_host = self.state_udp_host
+            target_port = self.state_udp_port
+            try:
+                ip_obj = ipaddress.ip_address(target_host)
+                family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
+            except ValueError:
+                try:
+                    infos = socket.getaddrinfo(target_host, target_port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+                    chosen = (
+                        next((ai for ai in infos if ai[0] == socket.AF_INET6), None)
+                        or next((ai for ai in infos if ai[0] == socket.AF_INET), None)
+                    )
+                    if chosen:
+                        family = chosen[0]
+                        target_host = chosen[4][0]
+                        target_port = chosen[4][1]
+                    else:
+                        family = socket.AF_INET
+                except Exception:
+                    family = socket.AF_INET
+
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
+                s.sendto(b"STOP", (target_host, target_port))
         except Exception:
             pass
         if self._state_server_thread:
@@ -1567,50 +1698,84 @@ class Display:
         return True
 
     def _udp_state_server_loop(self):
+        sock = None
+        bind_host = self.state_udp_host
+        bind_port = self.state_udp_port
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(0.5)
-            sock.bind((self.state_udp_host, self.state_udp_port))
-            self._state_server_sock = sock
-        except Exception as e:
-            logging.error(f"Display UDP server bind failed: {e}")
-            return
-
-        while not self._state_server_stop.is_set():
+            logging.info(f"Display UDP server binding to {bind_host}:{bind_port}")
+            # Validate host and choose AF based on IPv4/IPv6
             try:
-                data, addr = self._state_server_sock.recvfrom(4096)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                logging.error(f"Display UDP server recv error: {e}")
-                continue
+                ipaddress.ip_address(bind_host)
+            except ValueError:
+                logging.warning(f"Display UDP server: invalid bind host '{bind_host}', falling back to 0.0.0.0")
+                bind_host = '0.0.0.0'
 
-            if not data:
-                continue
-            msg = data.decode('utf-8', errors='ignore').strip()
-            if msg == 'GET_STATE':
-                payload = {
-                    'address': self.address,
-                    'port': self.port,
-                    'res_x': self.res_x,
-                    'res_y': self.res_y,
-                }
+            family = socket.AF_INET6 if ':' in bind_host else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            if family == socket.AF_INET6:
                 try:
-                    self._state_server_sock.sendto(json.dumps(payload).encode('utf-8'), addr)
-                except Exception as e:
-                    logging.error(f"Display UDP server send error: {e}")
-            elif msg == 'STOP':
-                break
-            else:
-                # Ignore unknown messages
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except Exception:
+                    pass
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except Exception:
                 pass
+            sock.settimeout(0.5)
+            sock.bind((bind_host, bind_port))
+            self._state_server_sock = sock
+
+            while not self._state_server_stop.is_set():
+                try:
+                    data, addr = self._state_server_sock.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logging.error(f"Display UDP server recv error: {e}")
+                    continue
+
+                if not data:
+                    continue
+                msg = data.decode('utf-8', errors='ignore').strip()
+                if msg == 'GET_STATE':
+                    payload = {
+                        'address': self.address,
+                        'port': self.port,
+                        'res_x': self.res_x,
+                        'res_y': self.res_y,
+                    }
+                    try:
+                        self._state_server_sock.sendto(json.dumps(payload).encode('utf-8'), addr)
+                    except Exception as e:
+                        logging.error(f"Display UDP server send error: {e}")
+                elif msg == 'STOP':
+                    break
+                else:
+                    # Ignore unknown messages
+                    pass
+        except Exception as e:
+            logging.error(f"Display UDP server bind failed on {self.state_udp_host}:{self.state_udp_port}: {e}")
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self._state_server_sock = None
+            logging.info("Display UDP server socket closed")
 
     @staticmethod
     def query_state(host=None, port=None, timeout=0.5):
         host = host or os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
         port = int(port or os.environ.get('DISPLAY_STATE_UDP_PORT', '6100'))
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                ip_obj = ipaddress.ip_address(host)
+                family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
+            except ValueError:
+                family = socket.AF_INET
+
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
                 s.settimeout(timeout)
                 s.sendto(b'GET_STATE', (host, port))
                 data, _ = s.recvfrom(4096)
@@ -1638,21 +1803,23 @@ class Display:
 
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
-        logging.debug("display: {} windows in whitelist".format(len(windows)))
+        logging.debug(f"display: {len(windows)} windows in whitelist")
 
         return windows
 
     def get_windows(self, blacklist=None):
-        cmd = "swaymsg -s {} -t get_tree".format(self.socket_path)
+        cmd = ['swaymsg', '-s', self.socket_path, '-t', 'get_tree']
         windows = []
 
         p = subprocess.Popen(cmd,
-                     shell=True,
-                     stdout=subprocess.PIPE,
-                     stderr=subprocess.PIPE,
-                     env=env)
+                             shell=False,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
+                             encoding='utf8',
+                             env=env)
 
-        data = json.loads(p.communicate()[0])
+        out, err = p.communicate()
+        data = json.loads(out)
 
         for output in data['nodes']:
             if output.get('type') == 'output':
@@ -1662,41 +1829,60 @@ class Display:
                         windows += self.workspace_nodes(ws)
 
         if blacklist:
-            windows_whitelist = windows.copy()
-            for win in windows:
-                if win["id"] in blacklist:
-                    windows_whitelist.pop()
-
-            return windows_whitelist
+            return [w for w in windows if w.get("id") not in blacklist]
 
         return windows
 
     # Extracts all windows from sway workspace json
     def workspace_nodes(self, workspace):
         windows = []
-
         floating_nodes = workspace.get('floating_nodes')
-
         for floating_node in floating_nodes:
             windows.append(floating_node)
-
         nodes = workspace.get('nodes')
-
-        for node in nodes:
-            # Leaf node
-            if len(node.get('nodes')) == 0:
+        stack = list(nodes)
+        while stack:
+            node = stack.pop()
+            children = node.get('nodes')
+            if not children:
                 windows.append(node)
-            # Nested node
             else:
-                for inner_node in node.get('nodes'):
-                    nodes.append(inner_node)
-
+                for inner_node in children:
+                    stack.append(inner_node)
         return windows
 
     def active_window(self):
-        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | \
-               select(.focused==true).id"'\
-               .format(self.socket_path)
+        """Return the active window id or None if unavailable."""
+        try:
+            cmd = ['swaymsg', '-s', self.socket_path, '-t', 'get_tree']
+            p = subprocess.Popen(cmd,
+                                 shell=False,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 encoding='utf8',
+                                 env=env)
+            out, err = p.communicate()
+            if p.returncode != 0:
+                logging.debug(f"active_window: swaymsg error: {err}")
+                return None
+            data = json.loads(out)
+
+            def _find_focused(node):
+                if not isinstance(node, dict):
+                    return None
+                if node.get('focused') is True and 'id' in node:
+                    return node['id']
+                for key in ('nodes', 'floating_nodes'):
+                    for child in node.get(key, []) or []:
+                        fid = _find_focused(child)
+                        if fid is not None:
+                            return fid
+                return None
+
+            return _find_focused(data)
+        except Exception as e:
+            logging.debug(f"active_window: failed to determine active window: {e}")
+            return None
 
     def focus_next_window(self, t_focus_s):
         while True:
@@ -1704,58 +1890,54 @@ class Display:
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
                 if len(self.switching_windows) == 0:
-                    logging.debug("display: Expected no windows but found {}"
-                                  .format(nwins))
+                    logging.debug(
+                        f"display: Expected no windows but found {len(self.switching_windows)}"
+                    )
 
                     continue
 
             next_window = self.switching_windows.pop()
-            logging.info("display: Switching focus to: {}"
-                         .format(next_window["id"]))
-            cmd = "swaymsg -s {} [con_id={}] focus"\
-                  .format(self.socket_path, next_window["id"])
-            p = subprocess.Popen(cmd, shell=True, env=env)
+            logging.info(f"display: Switching focus to: {next_window['id']}")
+            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'focus']
+            p = subprocess.Popen(cmd, shell=False, env=env)
             p.communicate()[0]
 
     async def fullscreen_next_window(self):
         await asyncio.sleep(random.random() * 3)
         t = round(time.time() - self.start_time, 1)
-        logging.info("Finished task: {}".format(t))
+        logging.info(f"Finished task: {t}")
 
         if len(self.switching_windows) == 0:
-            self.switching_windows = self.get_windows_debugwhitelist()
+            self.switching_windows = self.get_windows_whitelist()
             if len(self.switching_windows) == 0:
                 logging.debug("display: Expected windows to display but there is none")
 
                 return
 
         next_window = self.switching_windows.pop()
-        logging.info("display: Switching focus to: {}"
-                     .format(next_window["id"]))
+        logging.info(f"display: Switching focus to: {next_window['id']}")
 
-        cmd = "swaymsg -s {} [con_id={}] fullscreen"\
-              .format(self.socket_path, next_window["id"])
+        cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'fullscreen']
 
         p = subprocess.Popen(cmd,
-                     shell=True,
+                     shell=False,
                      env=env)
 
         p.communicate()[0]
 
     async def task_scheduler(self, interval_s, interval_function):
         while True:
-            logging.info("Starting periodic function: {}"
-                         .format(round(time.time() - self.start_time, 1)))
+            logging.info(f"Starting periodic function: {round(time.time() - self.start_time, 1)}")
             await asyncio.gather(
                 asyncio.sleep(interval_s),
                 interval_function(),
             )
 
     def switch_workspace(self, ws):
-        cmd = "swaymsg -s {} workspace {}".format(self.socket_path, ws)
+        cmd = ['swaymsg', '-s', self.socket_path, 'workspace', str(ws)]
 
         p = subprocess.Popen(cmd,
-                     shell=True,
+                     shell=False,
                      encoding="utf8",
                      env=env)
 
@@ -1768,12 +1950,21 @@ class Display:
 def screenshot(path=None):
     if path is None:
         path = "/tmp/screenshot.png"
-    logging.info("Saving screenshot to {}".format(path))
+    logging.info(f"Saving screenshot to {path}")
     cmd = [cmds["screenshot"], path]
     try:
-        subprocess.run(cmd, env=os.environ.copy(), check=False)
+        res = subprocess.run(cmd, env=os.environ.copy(), check=False)
     except Exception as e:
-        logging.error("screenshot: Failed to capture: {}".format(e))
+        logging.error(f"screenshot: Failed to capture: {e}")
+        return None
+    # Validate that the file exists and is non-empty
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            logging.error("screenshot: Output file missing or empty")
+            return None
+    except Exception as e:
+        logging.error(f"screenshot: Failed to stat output: {e}")
+        return None
     return path
 
 
@@ -1833,13 +2024,13 @@ def moonphase(location="Berlin"):
         return None, None, None
 
 
-def dawn_sunset(location="Berlin"):
+def sunrise_sunset(location="Berlin"):
     """
-    Fetches dawn and sunset times for today and tomorrow from wttr.in for the given location.
+    Fetches sunrise and sunset times for today and tomorrow from wttr.in for the given location.
     Returns:
         dict: {
-            "today": {"dawn": str, "sunset": str},
-            "tomorrow": {"dawn": str, "sunset": str}
+            "today": {"sunrise": str, "sunset": str},
+            "tomorrow": {"sunrise": str, "sunset": str}
         }
         or None on failure.
     """
@@ -1852,12 +2043,12 @@ def dawn_sunset(location="Berlin"):
         for idx, key in zip([0, 1], ["today", "tomorrow"]):
             if idx < len(weather):
                 astronomy = weather[idx].get("astronomy", [{}])[0]
-                dawn = astronomy.get("dawn", None)
+                sunrise = astronomy.get("sunrise", None)
                 sunset = astronomy.get("sunset", None)
-                result[key] = {"dawn": dawn, "sunset": sunset}
+                result[key] = {"sunrise": sunrise, "sunset": sunset}
         return result
     except Exception as e:
-        logging.error(f"Failed to fetch dawn/sunset: {e}")
+        logging.error(f"Failed to fetch sunrise/sunset: {e}")
         return None
 
 
@@ -1889,10 +2080,22 @@ def next_bank_holidays(location="Germany", count=3):
     today = datetime.date.today()
     year = today.year
     country_code = country_map.get(location, location)
+    # Validate country code (ISO 3166-1 alpha-2 expected)
+    if not isinstance(country_code, str) or len(country_code) != 2 or not country_code.isalpha():
+        logging.error(f"Bank holidays: invalid country '{location}' -> '{country_code}'")
+        return None
+    country_code = country_code.upper()
     url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/{country_code}"
     try:
         resp = requests.get(url, timeout=10)
-        holidays = resp.json()
+        if resp.status_code != 200:
+            logging.error(f"Failed to fetch bank holidays ({country_code}) for {year}: HTTP {resp.status_code}")
+            return None
+        try:
+            holidays = resp.json()
+        except Exception as e:
+            logging.error(f"Failed to decode bank holidays JSON: {e}")
+            return None
         # Filter for holidays after today
         upcoming = [
             h for h in holidays
@@ -1902,7 +2105,15 @@ def next_bank_holidays(location="Germany", count=3):
         if len(upcoming) < count:
             url_next = f"https://date.nager.at/api/v3/PublicHolidays/{year+1}/{country_code}"
             resp_next = requests.get(url_next, timeout=10)
-            holidays_next = resp_next.json()
+            if resp_next.status_code == 200:
+                try:
+                    holidays_next = resp_next.json()
+                except Exception as e:
+                    logging.error(f"Failed to decode bank holidays JSON (next year): {e}")
+                    holidays_next = []
+            else:
+                logging.warning(f"Bank holidays next year fetch returned HTTP {resp_next.status_code}")
+                holidays_next = []
             upcoming += holidays_next
             # Filter again for only future holidays
             upcoming = [
@@ -1988,8 +2199,7 @@ class HtmlPage:
         state = Display.query_state()
         if not state:
             return "<p>Display state unavailable</p>"
-
-        name = "display-0"
+        name = socket.gethostname()
         address = state.get('address')
         port = state.get('port')
         res_x = state.get('res_x')
@@ -2045,7 +2255,7 @@ class HtmlPage:
 
     @staticmethod
     def page_display():
-        # Top screenshot image that refreshes via fetch
+        # screenshot image that refreshes via fetch
         body = (
             '<img id="screenshot" src="/api/v1/screenshot" alt="Screenshot" style="max-width:100%;" />'
             '<script>'
@@ -2075,8 +2285,7 @@ if __name__ == "__main__":
                         dest='debug',
                         env_var='DEBUG',
                         help="Show debug output",
-                        type=bool,
-                        default=False)
+                        action='store_true')
     parser.add_argument('--uri',
                         dest='uris',
                         env_var='URI',
@@ -2161,12 +2370,12 @@ if __name__ == "__main__":
                         help="The MQTT topics to subscribe to",
                         type=str,
                         action='append')
-    parser.add_argument('--probe-ip',
-                        dest='probe_ip',
-                        env_var='PROBE_IP',
-                        help="The address to probe for",
-                        type=str,
-                        default="9.9.9.9")
+    # Preferred flag/env
+    parser.add_argument('--probe-ip-address',
+                        dest='probe_ip_address',
+                        env_var='PROBE_IP_ADDRESS',
+                        help="The IP address to probe for",
+                        type=str)
     parser.add_argument('--theme',
                         dest='theme_name',
                         env_var='THEME',
@@ -2177,8 +2386,7 @@ if __name__ == "__main__":
                         dest='update_controller',
                         env_var='UPDATE_CONTROLLER',
                         help="Fetch latest controller.py on startup",
-                        type=bool,
-                        default=False)
+                        action='store_true')
     parser.add_argument('--controller-update-url',
                         dest='controller_update_url',
                         env_var='CONTROLLER_UPDATE_URL',
@@ -2189,11 +2397,9 @@ if __name__ == "__main__":
                         dest='zeroconf_publish_service',
                         env_var='ZEROCONF_PUBLISH',
                         help="Publish service via mDNS",
-                        type=bool,
-                        default=False)
+                        action='store_true')
     parser.add_argument('--zeroconf-service-name-prefix',
                         dest='zeroconf_service_name_prefix',
-                        env_var='ZEROCONF_PREFIX',
                         help="The name prefix of the service",
                         type=str,
                         default="controller")
@@ -2203,6 +2409,12 @@ if __name__ == "__main__":
                         help="The type of service",
                         type=str,
                         default="_http._tcp.local.")
+    parser.add_argument('--apod-api-key',
+                        dest='apod_api_key',
+                        env_var='APOD_API_KEY',
+                        help='API key for NASA APOD',
+                        type=str,
+                        default=None)
 
     args = parser.parse_args()
     if isinstance(args.uris, str):
@@ -2212,9 +2424,19 @@ if __name__ == "__main__":
     if uris_list and isinstance(uris_list[0], str) and "|" in uris_list[0]:
         uris_list = uris_list[0].split("|")
     args.uris = uris_list
-    # Same for MQTT topics
-    if args.mqtt_topics and gs.mqtt_topics[0].find("|") != -1:
-        args.mqtt_topics[0] = args.mqtt_topics[0].split("|")
+    # Same for MQTT topics: normalize to list, split common separators
+    if args.mqtt_topics:
+        raw_topics = args.mqtt_topics if isinstance(args.mqtt_topics, list) else [args.mqtt_topics]
+        topics_flat = []
+        for entry in raw_topics:
+            if isinstance(entry, str):
+                for token in re.split(r"[|,;\s]+", entry):
+                    token = token.strip()
+                    if token:
+                        topics_flat.append(token)
+        args.mqtt_topics = topics_flat if topics_flat else []
+    else:
+        args.mqtt_topics = []
 
     debug = args.debug
     uris = args.uris
@@ -2229,8 +2451,9 @@ if __name__ == "__main__":
     mqtt_user = args.mqtt_user
     mqtt_pw = args.mqtt_pw
     mqtt_topics = args.mqtt_topics
-    probe_ip = args.probe_ip
+    probe_ip_address = args.probe_ip_address
     theme_name = args.theme_name
+    apod_api_key = args.apod_api_key
     update_controller = args.update_controller
     controller_update_url = args.controller_update_url
     zeroconf_publish_service = args.zeroconf_publish_service
@@ -2238,7 +2461,6 @@ if __name__ == "__main__":
     zc_service_type = args.zeroconf_service_type
     logfile = args.logfile
     loglevel = args.loglevel
-    loglevel = DEBUG
     log_format = '[%(asctime)s] \
     {%(filename)s:%(lineno)d} %(levelname)s - %(message)s'
     del locals()['args']
@@ -2276,32 +2498,30 @@ if __name__ == "__main__":
 
     for dep in dependencies:
         if which(dep) is None:
-            logging.error("Could not find dependency: " + dep + ", aborting..")
+            logging.error(f"Could not find dependency: {dep}, aborting..")
             sys.exit(1)
 
     env = os.environ.copy()
 
     if debug:
         for k, v in env.items():
-            logging.debug(k + '=' + v)
+            logging.debug(f"{k}={v}")
             logging.debug(System.list_processes())
 
     if listen_port < 1025 or listen_port > 65535:
-        logging.error("Invalid port, aborting..")
+        logging.error(f"Invalid port {listen_port}, aborting..")
         sys.exit(1)
 
     if stream_source not in stream_sources:
         sources_str = " ".join(str(x) for x in stream_sources)
-        logging.error("Invalid source: {}, aborting..".format(stream_source))
-        logging.info("Possible choices are: " + sources_str)
-        #sys.exit(1)
+        logging.error(f"Invalid source: {stream_source}, aborting..")
+        logging.info(f"Possible choices are: {sources_str}")
+        sys.exit(1)
 
     hostname = socket.gethostname()
     local_ip = ""
 
-    local_ip = System.net_iface_address(probe_ip)
-    if not local_ip:
-        local_ip = System.net_iface_address(probe_ip)
+    local_ip = System.net_iface_address(probe_ip_address)
 
     path_update = "/tmp/controller-updated"
     if update_controller and not os.path.exists(path_update):
@@ -2318,21 +2538,20 @@ if __name__ == "__main__":
 
     nwins = len(display.get_windows())
     if nwins > 0:
-        logging.warning("Expected no windows but found {}"
-                        .format(nwins))
+        logging.warning(f"Expected no windows but found {nwins}")
 
     theme = Theme(theme_name)
     logging.info(f"PATH: {env.get('PATH', '')}")
-    logging.info("Using theme: {}".format(theme_name))
-    logging.info("URIs: {}".format(uris))
+    logging.info(f"Using theme: {theme_name}")
+    logging.info(f"URIs: {uris}")
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
-    logging.info("Playlist: {}".format(playlist))
-    threads = playlist.start_player(probe_ip)
+    logging.info(f"Playlist: {playlist}")
+    threads = playlist.start_player(probe_ip_address)
     started = len(threads)
     expected = len(playlist.playlist)
-    logging.info("Started {} {}".format(started, "player" if started == 1 else "players"))
+    logging.info(f"Started {started} {'player' if started == 1 else 'players'}")
     if expected != started:
-        logging.info("Player mismatch: expected {} from URIs, started {}".format(expected, started))
+        logging.info(f"Player mismatch: expected {expected} from URIs, started {started}")
     iss = Iss(threads)
 
     stream = Stream(stream_source)
@@ -2342,7 +2561,7 @@ if __name__ == "__main__":
         zc_listen_address = listen_address
 
         if "0.0.0.0" == zc_listen_address:
-            zc_listen_address = System.net_iface_address(probe_ip)
+            zc_listen_address = System.net_iface_address(probe_ip_address)
 
         zc_listen_port = listen_port
 
@@ -2396,14 +2615,12 @@ if __name__ == "__main__":
     # Start ASGI server via Daphne
     try:
         cmd = ['daphne', '-b', listen_address, '-p', str(listen_port), 'controller:asgi_app']
-        logging.info("Starting Daphne ASGI server on %s:%s" % (listen_address, listen_port))
+        logging.info(f"Starting Daphne ASGI server on {listen_address}:{listen_port}")
         # Ensure the controller directory is importable so Daphne can import 'controller:asgi_app'
         module_dir = os.path.dirname(os.path.abspath(__file__))
         env_mod = os.environ.copy()
         env_mod['PYTHONPATH'] = module_dir + (os.pathsep + env_mod['PYTHONPATH'] if 'PYTHONPATH' in env_mod else '')
-        subprocess.run(cmd, env=env_mod)
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        subprocess.run(cmd, env=env, shell=True)
+        subprocess.run(cmd, env=env_mod, check=False)
     except FileNotFoundError:
         logging.error("Daphne not found. Install 'daphne' to run the ASGI server.")
         sys.exit(1)
