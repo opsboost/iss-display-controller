@@ -3,14 +3,12 @@ import requests
 import asyncio
 import configargparse
 from doi.main import *
-from hnapi import HnApi
 import html
 import ipaddress
 import json
 import logging
 from logging import DEBUG
 import os
-from paho.mqtt import client as mqtt_client
 from pathlib import Path
 import platform
 import random
@@ -21,7 +19,6 @@ import subprocess
 from subprocess import Popen, PIPE
 import shutil
 import signal
-import sqlite3
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
 import sys
@@ -163,12 +160,6 @@ def reexec_self():
     logging.info("Restarting after update..")
     # Re-execute the current script
     os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-def skip_comments(file):
-    for line in file:
-        if not line.strip().startswith('#'):
-            yield line.strip()
 
 
 def create_playlist_item_crd(num, uri, player, playtime_s, name="playlistitem-sample", namespace="default"):
@@ -680,7 +671,7 @@ class Playlist:
         sys = System.sys_data()
         texts = list()
         texts.append(System.os_release())
-        texts.append(System.uptime())
+        texts.append(System.uptime(env))
         texts.append(f"Display started: {display.started}")
         texts.append(sys["uptime"])
         texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
