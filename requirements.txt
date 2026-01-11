@@ -1,6 +1,6 @@
 cairocffi >= 1.7.1
 configargparse >= 1.7.1
-git+https://github.com/bbusse/@oneshot#egg=doi
+git+https://github.com/bbusse/doi@oneshot#egg=doi
 starlette >= 0.38.0
 hntop >= 0.0.10
 requests >= 2.32.5
