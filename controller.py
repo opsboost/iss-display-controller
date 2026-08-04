@@ -2,7 +2,7 @@
 import requests
 import asyncio
 import configargparse
-from doi.main import *
+from doi.main import APOD, Calendar, MQTT, Music, News, OTD, System, Weather
 import html
 import ipaddress
 import json
@@ -21,6 +21,7 @@ import shutil
 import signal
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
+from starlette.routing import Route
 import sys
 import tempfile
 import time
@@ -29,12 +30,13 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
 import wayland.protocol
 
+# Suppress protocol.py INFO messages
+import logging
+logging.getLogger("wayland.protocol").setLevel(logging.WARNING)
+
 # Ensure child processes inherit the runtime environment (including PATH)
 env = os.environ.copy()
 
-# Prepare ASGI app for API and web ui
-app = Starlette()
-asgi_app = app
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"clock":        "humanbeans_clock",
@@ -43,28 +45,23 @@ cmds = {"clock":        "humanbeans_clock",
         "screenshot":   "grim"}
 
 
-@app.route("/", methods=["GET"], name="web_main")
 def web_main(request):
     return HTMLResponse(HtmlPage.page_display())
 
-@app.route("/display", methods=["GET"], name="web_display")
 def web_display(request):
     return HTMLResponse(HtmlPage.page_display())
 
 
 # Readiness
-@app.route('/healthy', methods=["GET"], name="healthy")
 def healthy(request):
     return PlainTextResponse("OK")
 
 
 # Liveness
-@app.route('/healthz', methods=["GET"], name="healthz")
 def healthz(request):
     return PlainTextResponse(probe_liveness())
 
 
-@app.route("/api/v1/display", methods=["GET"], name="api_display")
 def screen(request):
     state = Display.query_state()
     if not state:
@@ -82,7 +79,6 @@ def screen(request):
     }
     return JSONResponse(data)
 
-@app.route("/screenshot", methods=["GET"], name="screenshot")
 def display_screenshot(request):
     fn = screenshot()
     if not fn or not os.path.exists(fn):
@@ -90,7 +86,6 @@ def display_screenshot(request):
         return PlainTextResponse("Not Found", status_code=404)
     return FileResponse(fn, media_type='image/png')
 
-@app.route("/api/v1/screenshot", methods=["GET"], name="api_screenshot")
 def api_screenshot(request):
     return display_screenshot(request)
 
@@ -123,12 +118,24 @@ def list_routes(app_instance=None):
 
     return _walk(app_instance.routes)
 
-@app.route("/api/v1/routes", methods=["GET"], name="api_routes")
 def api_routes(request):
     return JSONResponse(list_routes())
 
 def probe_liveness():
     return "OK"
+
+# Prepare ASGI app for API and web ui
+app = Starlette(routes=[
+    Route("/", web_main, methods=["GET"], name="web_main"),
+    Route("/display", web_display, methods=["GET"], name="web_display"),
+    Route("/healthy", healthy, methods=["GET"], name="healthy"),
+    Route("/healthz", healthz, methods=["GET"], name="healthz"),
+    Route("/api/v1/display", screen, methods=["GET"], name="api_display"),
+    Route("/screenshot", display_screenshot, methods=["GET"], name="screenshot"),
+    Route("/api/v1/screenshot", api_screenshot, methods=["GET"], name="api_screenshot"),
+    Route("/api/v1/routes", api_routes, methods=["GET"], name="api_routes"),
+])
+asgi_app = app
 
 
 def which(cmd):
@@ -236,29 +243,31 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
     day_str = str(today.day).rjust(2)
     day_name = today.strftime("%A")
 
+    # Insert an empty line between the month name and the day names row
+    if len(lines) > 1:
+        lines = lines[:1] + [''] + lines[1:]
+
+    def highlight(match):
+        if output == 'terminal':
+            return f"\033[1;7m{match.group(0)}\033[0m"
+        elif output == 'wayland-view':
+            font_face = "Monospace"
+            font_size = 20
+            font_face_hilight = "Monospace"
+            font_size_hilight = 23
+            markup = (
+                f"</span><span foreground=\"orange\" font=\"{font_face_hilight} {font_size_hilight}\">{match.group(0)}</span>"
+                f"<span foreground=\"white\" font=\"{font_face} {font_size}\">"
+            )
+            return markup
+
+    def highlight_day_name(match):
+        if output == 'terminal':
+            return f"\033[1;7m{match.group(0)}\033[0m"
+        elif output == 'wayland-view':
+            return f"<span foreground=\"orange\" font=\"Monospace 23\">{match.group(0)}</span>"
+
     for line in lines:
-        # Highlight the current day
-        def highlight(match):
-            if output == 'terminal':
-                return f"\033[1;7m{match.group(0)}\033[0m"
-            elif output == 'wayland-view':
-                font_face = "Monospace"
-                font_size = 20
-                font_face_hilight = "Monospace"
-                font_size_hilight = 23
-                markup = (
-                    f"</span><span foreground=\"orange\" font=\"{font_face_hilight} {font_size_hilight}\">{match.group(0)}</span>"
-                    f"<span foreground=\"white\" font=\"{font_face} {font_size}\">"
-                )
-                return markup
-
-        # Highlight the current day
-        def highlight_day_name(match):
-            if output == 'terminal':
-                return f"\033[1;7m{match.group(0)}\033[0m"
-            elif output == 'wayland-view':
-                return f"<span foreground=\"orange\" font=\"Monospace 23\">{match.group(0)}</span>"
-
         # Apply highlights if present
         line = re.sub(rf'(?<!\d){day_str}(?!\d)', highlight, line)
         line = re.sub(rf'\b{today.strftime("%a")}\b', highlight_day_name, line)
@@ -288,7 +297,7 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
         texts = []
         texts.append("\n".join(highlighted_lines))
         # Add next 3 bank holidays under the calendar
-        holidays = next_bank_holidays(location="Germany", count=3)
+        holidays = Calendar.next_bank_holidays(location="Germany", count=3)
         if holidays:
             holiday_lines = []
             for h in holidays:
@@ -301,7 +310,7 @@ def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False
         if len(texts) > 1:
             view.s_objects[1]["font_size"] = 16
             view.s_objects[1]["alignment"] = "left"
-        view.show_text(texts, img_bg, html_escape=False)
+        view.show_content(texts, img_bg, html_escape=False)
 
 
 class Zeroconf_service:
@@ -620,8 +629,19 @@ class Playlist:
             logging.info("MQTT: Failed to connect")
             return False
 
+        def render_mqtt_view(topic, texts):
+            view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+            for i in range(len(texts)):
+                if i == 0:
+                    view.s_objects[i]["font_size"] = 64
+                    view.s_objects[i]["alignment"] = "center"
+                else:
+                    view.s_objects[i]["font_size"] = 48
+                    view.s_objects[i]["alignment"] = "center"
+            view.show_content(texts, theme.img_bg)
+
         for topic in topics:
-            mqtt.subscribe(mqttc, topic, theme)
+            mqtt.subscribe(mqttc, topic, render_mqtt_view)
             logging.info(f"MQTT: Subscribed to {topic}")
 
         mqttc.loop_forever()
@@ -647,15 +667,10 @@ class Playlist:
         texts.append(net["public_ip"])
         texts.append(net["resolvconf"])
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.s_objects[0]["font_size"] = 20
-        view.s_objects[0]["alignment"] = "left"
-        view.s_objects[1]["font_size"] = 20
-        view.s_objects[1]["alignment"] = "left"
-        view.s_objects[2]["font_size"] = 20
-        view.s_objects[2]["alignment"] = "left"
-        view.s_objects[3]["font_size"] = 20
-        view.s_objects[3]["alignment"] = "left"
-        view.show_text(texts, img_bg)
+        for i in range(len(texts)):
+            view.s_objects[i]["font_size"] = 20
+            view.s_objects[i]["alignment"] = "left"
+        view.show_content(texts, img_bg)
 
     def start_proc_view(self, img_bg):
         texts = list()
@@ -663,15 +678,22 @@ class Playlist:
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 14
         view.s_objects[0]["alignment"] = "left"
-        view.show_text(texts, img_bg)
+        view.show_content(texts, img_bg)
 
     def start_sys_view(self, img_bg, probe_ip_address):
         logging.info("Starting sys view")
         net = System.net_data(probe_ip_address)
         sys = System.sys_data()
-        texts = list()
+        texts = []
         texts.append(System.os_release())
-        texts.append(System.uptime(env))
+        texts.append("")  # Insert empty line after the first line
+        uptime_info = System.uptime(env)
+        if isinstance(uptime_info, dict):
+            texts.append(uptime_info.get("uptime", ""))
+            texts.append(uptime_info.get("users", ""))
+            texts.append(uptime_info.get("load", ""))
+        else:
+            texts.append(str(uptime_info))
         texts.append(f"Display started: {display.started}")
         texts.append(sys["uptime"])
         texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
@@ -681,25 +703,13 @@ class Playlist:
         texts.append(str(net["online_status"]) + " " + str(net["public_ip"]))
         texts.append(f"Listen address: {display.address}:{display.port}")
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.s_objects[0]["font_size"] = 24
-        view.s_objects[0]["alignment"] = "left"
-        view.s_objects[1]["font_size"] = 20
-        view.s_objects[1]["alignment"] = "left"
-        view.s_objects[2]["font_size"] = 20
-        view.s_objects[2]["alignment"] = "left"
-        view.s_objects[3]["font_size"] = 20
-        view.s_objects[3]["alignment"] = "left"
-        view.s_objects[4]["font_size"] = 20
-        view.s_objects[4]["alignment"] = "left"
-        view.s_objects[5]["font_size"] = 20
-        view.s_objects[5]["alignment"] = "left"
-        view.s_objects[6]["font_size"] = 20
-        view.s_objects[6]["alignment"] = "left"
-        view.s_objects[7]["font_size"] = 20
-        view.s_objects[7]["alignment"] = "left"
-        view.s_objects[8]["font_size"] = 20
-        view.s_objects[8]["alignment"] = "left"
-        view.show_text(texts, img_bg)
+        for i in range(len(texts)):
+            if i == 0:
+                view.s_objects[i]["font_size"] = 24
+            else:
+                view.s_objects[i]["font_size"] = 20
+            view.s_objects[i]["alignment"] = "left"
+        view.show_content(texts, img_bg)
 
     def start_weather_view(self, weather, img_bg):
         logging.info("Starting weather view")
@@ -721,12 +731,13 @@ class Playlist:
                     + " km/h"
                 )
                 texts.append(data["nearest_area"][0]["areaName"][0]["value"])
+                texts.append("")
             except Exception as e:
                 logging.error(f"weather: Unexpected data format: {e}")
                 texts.append("Weather data unavailable")
 
         # Add sunrise and sunset for today
-        sunrise_sunset_times = sunrise_sunset(location=weather.location)
+        sunrise_sunset_times = Calendar.sunrise_sunset(location=weather.location)
         if not sunrise_sunset_times:
             logging.info(f"No sunrise/sunset data returned for location: {weather.location}")
         elif "today" not in sunrise_sunset_times:
@@ -739,25 +750,31 @@ class Playlist:
             if not sunset:
                 logging.info(f"No 'sunset' value in sunrise/sunset data for location: {weather.location}: {sunrise_sunset_times['today']}")
             if sunrise and sunset:
-                texts.append(f"Sunrise: {sunrise}  Sunset: {sunset}")
-
-        # Add a margin (empty line) between location and moon data
-        texts.append("")
+                texts.append(f"Sunrise {sunrise}  Sunset {sunset}")
 
         # Add moon phase and icon
-        moon_phase, moon_icon, days_until_full_moon = moonphase(location=weather.location)
+        moon_phase, moon_icon, days_until_full_moon = Calendar.moonphase(location=weather.location)
+        moon_unicode_map = {
+            "New Moon": "\U0001F311",
+            "Waxing Crescent": "\U0001F312",
+            "First Quarter": "\U0001F313",
+            "Waxing Gibbous": "\U0001F314",
+            "Full Moon": "\U0001F315",
+            "Waning Gibbous": "\U0001F316",
+            "Last Quarter": "\U0001F317",
+            "Waning Crescent": "\U0001F318"
+        }
         if moon_phase:
-            moon_line = f"Moon: {moon_phase}"
+            moon_char = moon_unicode_map.get(moon_phase, "\U0001F319")
+            moon_line = f"{moon_char} Moon {moon_phase}"
             if days_until_full_moon is not None:
                 moon_line += f" ({days_until_full_moon} days to full)"
             texts.append(moon_line)
-            if moon_icon:
-                texts.append(moon_icon)
 
         # Fetch and display UV index
-        uv_index = fetch_uv_index(location=weather.location)
+        uv_index = Weather.fetch_uv_index(location=weather.location)
         if uv_index:
-            texts.append(f"UV Index: {uv_index}")
+            texts.append(f"UV Index {uv_index}")
 
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 80
@@ -770,14 +787,10 @@ class Playlist:
         for i in range(3, len(texts)):
             view.s_objects[i]["font_size"] = 20
             view.s_objects[i]["alignment"] = "left"
-        view.show_text(texts, img_bg)
-        # Show weather icon (already shown as first text if present)
-        # Show moon icon if present and not already shown
-        # (If you want to show as image, uncomment below)
-        # if moon_icon:
-        #     view.show_image(moon_icon)
-        # else:
-        view.show_image(icon)
+
+        view.show_content(texts, img_bg)
+        if icon:
+            view.show_image(icon)
 
     def start_music_view(self, img_bg):
         texts = list()
@@ -785,7 +798,7 @@ class Playlist:
         music_data = music.mpd()
         texts.append(music_data)
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.show_text(texts, img_bg)
+        view.show_content(texts, img_bg)
 
     def start_news_view(self, news, img_bg):
         texts = list()
@@ -801,7 +814,7 @@ class Playlist:
         view.s_objects[1]["font_size"] = 60
         if len(texts) > 2:
             view.s_objects[2]["font_size"] = 30
-        view.show_text(texts, img_bg)
+        view.show_content(texts, img_bg)
 
     def start_onthisday_view(self, otd, img_bg):
         texts = list()
@@ -819,7 +832,7 @@ class Playlist:
                 view.s_objects[i]["font_size"] = 40
             else:
                 view.s_objects[i]["font_size"] = 30
-        view.show_text(texts, img_bg)
+        view.show_content(texts, img_bg)
 
     def start_image_view(self, file):
         view = Wayland_view(display.res_x, display.res_y, 1, theme)
@@ -1018,7 +1031,7 @@ class Wayland_view:
         self.conn.disconnect()
         logging.info(f"Exiting wayland view: {view.shutdowncode}")
 
-    def show_text(self, texts, img_bg=False, fullscreen=False, html_escape=True):
+    def show_content(self, texts, img_bg=False, fullscreen=False, html_escape=True):
         logging.info(f"view: Have {len(texts)} text block(s)")
 
         n = 0
@@ -1030,10 +1043,22 @@ class Wayland_view:
                 self.s_objects[n]["text"] = str(text)
             n += 1
 
-        if img_bg:
-            self.s_objects[0]["file"] = img_bg
+        # Log the s_objects for debugging
+        for idx, obj in enumerate(self.s_objects):
+            if obj.get("file"):
+                logging.info(f"s_objects[{idx}] has file: {obj['file']}")
+            else:
+                logging.debug(f"s_objects[{idx}] has no file field or is empty")
+
+        # After all assignments, check for any file fields
+        use_images = any(obj.get("file") for obj in self.s_objects)
+        if use_images:
+            if img_bg:
+                self.s_objects[0]["file"] = img_bg
+            logging.info("Using draw_images_with_text for rendering (at least one s_object has a file)")
             draw_function = view.draw_images_with_text
         else:
+            logging.info("Using draw_text for rendering (no s_object has a file)")
             draw_function = view.draw_text
 
         w = view.Window(self.conn,
@@ -1076,7 +1101,7 @@ class Display:
         self.socket_path = self.get_socket_path()
         # UDP state server defaults
         self.state_udp_host = os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
-        self.state_udp_port = int(os.environ.get('DISPLAY_STATE_UDP_PORT', '6100'))
+        self.state_udp_port = int(os.environ.get('DISPLAY_STATE_UDP_PORT', '7042'))
         self._state_server_thread = None
         self._state_server_stop = threading.Event()
         self._state_server_sock = None
@@ -1262,6 +1287,33 @@ class Display:
         #path = "/tmp/sway.sock"
         return path
 
+    @staticmethod
+    def swaymsg_send_message(cmd, env=None, log_prefix=None):
+        """
+        Run a swaymsg command via subprocess, log stdout/stderr, and return stdout.
+        Args:
+            cmd (list): Command list for subprocess.
+            env (dict): Environment variables.
+            log_prefix (str): Prefix for log messages.
+        Returns:
+            str: stdout from the command.
+        """
+        p = subprocess.Popen(cmd,
+                            shell=False,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            encoding='utf8',
+                            env=env)
+
+        out, err = p.communicate()
+        prefix = log_prefix or "swaymsg"
+        if out:
+            logging.debug(f"{prefix}: stdout: {out}")
+        if err:
+            logging.warning(f"{prefix}: stderr: {err}")
+
+        return out
+
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
         logging.debug(f"display: {len(windows)} windows in whitelist")
@@ -1280,6 +1332,11 @@ class Display:
                              env=env)
 
         out, err = p.communicate()
+
+        if out:
+            logging.debug(f"get_windows: swaymsg stdout: {out}")
+        if err:
+            logging.warning(f"get_windows: swaymsg stderr: {err}")
         data = json.loads(out)
 
         for output in data['nodes']:
@@ -1316,16 +1373,7 @@ class Display:
         """Return the active window id or None if unavailable."""
         try:
             cmd = ['swaymsg', '-s', self.socket_path, '-t', 'get_tree']
-            p = subprocess.Popen(cmd,
-                                 shell=False,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE,
-                                 encoding='utf8',
-                                 env=env)
-            out, err = p.communicate()
-            if p.returncode != 0:
-                logging.debug(f"active_window: swaymsg error: {err}")
-                return None
+            out = self.swaymsg_send_message(cmd, env=env, log_prefix="active_window")
             data = json.loads(out)
 
             def _find_focused(node):
@@ -1360,8 +1408,7 @@ class Display:
             next_window = self.switching_windows.pop()
             logging.info(f"display: Switching focus to: {next_window['id']}")
             cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'focus']
-            p = subprocess.Popen(cmd, shell=False, env=env)
-            p.communicate()[0]
+            self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
 
     async def fullscreen_next_window(self):
         await asyncio.sleep(random.random() * 3)
@@ -1380,11 +1427,7 @@ class Display:
 
         cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'fullscreen']
 
-        p = subprocess.Popen(cmd,
-                     shell=False,
-                     env=env)
-
-        p.communicate()[0]
+        self.swaymsg_send_message(cmd, env=env, log_prefix="fullscreen_next_window")
 
     async def task_scheduler(self, interval_s, interval_function):
         while True:
@@ -1397,12 +1440,7 @@ class Display:
     def switch_workspace(self, ws):
         cmd = ['swaymsg', '-s', self.socket_path, 'workspace', str(ws)]
 
-        p = subprocess.Popen(cmd,
-                     shell=False,
-                     encoding="utf8",
-                     env=env)
-
-        res = p.communicate()[0]
+        self.swaymsg_send_message(cmd, env=env, log_prefix="switch_workspace")
 
     def screenshot(self):
         fn = self.screenshot_path + "/" + self.screenshot_file
@@ -1411,7 +1449,7 @@ class Display:
 def screenshot(path=None):
     if path is None:
         path = "/tmp/screenshot.png"
-    logging.info(f"Saving screenshot to {path}")
+    logging.debug(f"Saving screenshot to {path}")
     cmd = [cmds["screenshot"], path]
     try:
         res = subprocess.run(cmd, env=os.environ.copy(), check=False)
@@ -1437,6 +1475,49 @@ class Iss:
 
 class HtmlPage:
     @staticmethod
+    def get_css():
+        return """
+        <style>
+        #screenshot { max-width: 100%; display: block; }
+        .img-container {
+            position: relative;
+            display: inline-block;
+        }
+        #pause-btn {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            border: 2px solid #fff;
+            border-radius: 8px;
+            padding: 20px 40px;
+            font-size: 2.5em;
+            font-weight: bold;
+            cursor: pointer;
+            opacity: 0.85;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        table td {
+            padding: 0.5em 2em 0.5em 0.5em;
+        }
+        .tables-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2em;
+            margin-bottom: 1em;
+        }
+        .tables-row table {
+            margin-bottom: 0;
+        }
+        </style>
+        """
+
+    @staticmethod
     def show_display_data():
         state = Display.query_state()
         if not state:
@@ -1447,13 +1528,17 @@ class HtmlPage:
         res_x = state.get('res_x')
         res_y = state.get('res_y')
 
-        items = [
-            f"<li>Name: {html.escape(name)}</li>",
-            f"<li>Address: {html.escape(str(address))}</li>",
-            f"<li>Port: {html.escape(str(port))}</li>",
-            f"<li>Resolution: {html.escape(str(res_x))} x {html.escape(str(res_y))}</li>",
+        rows = [
+            ("Name", name),
+            ("Address", address),
+            ("Port", port),
+            ("Resolution", f"{res_x} x {res_y}")
         ]
-        return "<ul>" + "".join(items) + "</ul>"
+        table = ["<table>"]
+        for key, value in rows:
+            table.append(f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value))}</td></tr>")
+        table.append("</table>")
+        return "".join(table)
 
     @staticmethod
     def show_playlist_data():
@@ -1466,7 +1551,7 @@ class HtmlPage:
             uris_env = os.environ.get('URI') or os.environ.get('URIS')
             if uris_env:
                 # Split by common separators
-                for sep in ["\n", ",", ";"]:
+                for sep in ["|", " "]:
                     uris_env = uris_env.replace(sep, " ")
                 uris_list = [u.strip() for u in uris_env.split() if u.strip()]
                 try:
@@ -1497,17 +1582,27 @@ class HtmlPage:
 
     @staticmethod
     def page_display():
-        # screenshot image that refreshes via fetch
+        # screenshot image that refreshes via fetch, with pause button
         body = (
-            '<img id="screenshot" src="/api/v1/screenshot" alt="Screenshot" style="max-width:100%;" />'
+            '<div class="img-container">'
+            '  <button id="pause-btn" style="display:none;">⏸</button>'
+            '  <img id="screenshot" src="/api/v1/screenshot" alt="Screenshot" />'
+            '</div>'
             '<script>'
+            'let paused = false;'
+            'const btn = document.getElementById("pause-btn");'
+            'const img = document.getElementById("screenshot");'
+            'img.addEventListener("mouseenter", function() { btn.style.display = "block"; });'
+            'img.addEventListener("mouseleave", function() { btn.style.display = "none"; });'
+            'btn.addEventListener("mouseleave", function() { btn.style.display = "none"; });'
+            'btn.onclick = function() { paused = !paused; btn.innerText = paused ? "\u25B6" : "\u23F8"; };'
             'async function refreshScreenshot(){'
+            '  if(paused) return;'
             '  try {'
             '    const res = await fetch("/api/v1/screenshot", {cache: "no-store"});'
             '    if(!res.ok) return;'
             '    const blob = await res.blob();'
             '    const url = URL.createObjectURL(blob);'
-            '    const img = document.getElementById("screenshot");'
             '    const old = img.src;'
             '    img.src = url;'
             '    if(old.startsWith("blob:")) { try { URL.revokeObjectURL(old); } catch(_){} }'
@@ -1516,9 +1611,8 @@ class HtmlPage:
             'setInterval(refreshScreenshot, 1000);'
             '</script>'
         )
-        body += HtmlPage.show_display_data()
-        body += HtmlPage.show_playlist_data()
-        return "<html><head><title>ISS Display</title></head><body>" + body + "</body></html>"
+        body += '<div class="tables-row">' + HtmlPage.show_display_data() + HtmlPage.show_playlist_data() + '</div>'
+        return "<html><head><title>ISS Display</title>" + HtmlPage.get_css() + "</head><body>" + body + "</body></html>"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+[project]
+name = "iss-display-controller"
+version = "0.1.0"
+description = "ISS Display Controller"
+authors = [
+    { name = "Björn Busse", email = "bj.rn@baerlin.eu" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "cairocffi>=1.7.1",
+    "configargparse>=1.7.1",
+    "git+https://github.com/bbusse/doi@dev#egg=doi",
+    "starlette>=0.38.0",
+    "requests>=2.32.5",
+    "pangocffi>=0.13.0",
+    "pangocairocffi>=0.7.0",
+    "Pillow>=11.3.0",
+    "git+https://github.com/bbusse/python-wayland@dev#egg=wayland",
+    "git+https://github.com/bbusse/python-zeroconf@workaround-1088#egg=zeroconf",
+    "selenium>=4.36.0",
+    "xkbcommon>=1.5.1",
+    "git+https://github.com/bbusse/webdriver-util@main#egg=webdriver-util",
+    "asgiref>=3.11.0",
+    "daphne>=4.2.1",
+    "twisted[tls,http2]"
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
