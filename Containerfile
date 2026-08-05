@@ -22,7 +22,19 @@ RUN apk add --no-cache \
 FROM build AS build-venv
 
 COPY requirements.txt /requirements.txt
-RUN /venv/bin/pip install --disable-pip-version-check -r /requirements.txt
+# pip/setuptools/wheel are build-time only; stripped here so the copied venv
+# never carries them into the final image's layer history
+RUN /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
+    && rm -rf /venv/lib/python3.*/site-packages/pip \
+               /venv/lib/python3.*/site-packages/pip-*.dist-info \
+               /venv/lib/python3.*/site-packages/setuptools \
+               /venv/lib/python3.*/site-packages/setuptools-*.dist-info \
+               /venv/lib/python3.*/site-packages/wheel \
+               /venv/lib/python3.*/site-packages/wheel-*.dist-info \
+               /venv/lib/python3.*/site-packages/pkg_resources \
+               /venv/lib/python3.*/site-packages/_distutils_hack \
+               /venv/lib/python3.*/site-packages/distutils-precedence.pth \
+               /venv/bin/pip*
 
 # Minimal runtime on Alpine; ensure Python runtime libs present
 FROM alpine:edge

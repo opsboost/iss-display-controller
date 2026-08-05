@@ -62,10 +62,36 @@ def healthz(request):
     return PlainTextResponse(probe_liveness())
 
 
+def get_playlist_items():
+    """
+    Return the current playlist's items, preferring the live global `playlist`
+    (set when running as __main__) and falling back to rebuilding it from the
+    URI/URIS env var (needed when running as a separate Daphne subprocess,
+    which never executes the __main__ block).
+    """
+    pl_global = globals().get('playlist') if 'playlist' in globals() else None
+    if pl_global:
+        return pl_global.playlist
+
+    uris_env = os.environ.get('URI') or os.environ.get('URIS')
+    if not uris_env:
+        return []
+    for sep in ["|", " "]:
+        uris_env = uris_env.replace(sep, " ")
+    uris_list = [u.strip() for u in uris_env.split() if u.strip()]
+    if not uris_list:
+        return []
+    try:
+        tmp_pl = Playlist(uris_list, 5, Theme('default'), [], None)
+        return tmp_pl.create(uris_list)
+    except Exception:
+        return []
+
 def screen(request):
     state = Display.query_state()
     if not state:
         return PlainTextResponse("Service Unavailable", status_code=503)
+    playlist_items = get_playlist_items()
     data = {
         "name": socket.gethostname(),
         "os_release": "iss-display",
@@ -73,8 +99,8 @@ def screen(request):
         "listen_port": state.get('port'),
         "res_x": state.get('res_x'),
         "res_y": state.get('res_y'),
-        "playlist": globals().get('playlist').playlist if 'playlist' in globals() else [],
-        "uris": globals().get('playlist').uris if 'playlist' in globals() else [],
+        "playlist": playlist_items,
+        "uris": [item.get("uri") for item in playlist_items],
         "streams": globals().get('stream').streams if 'stream' in globals() else [],
     }
     return JSONResponse(data)
@@ -451,7 +477,7 @@ class Playlist:
                 item["player"] = "news"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-otd://"):
-                otd_sources = {"wikipedia" : ""},
+                otd_sources = {"wikipedia" : ""}
                 self.otd = OTD(otd_sources)
                 item["num"] = n
                 item["uri"] = uri
@@ -796,7 +822,7 @@ class Playlist:
         texts = list()
         music = Music()
         music_data = music.mpd()
-        texts.append(music_data)
+        texts.append(music_data if music_data else "No music data available")
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.show_content(texts, img_bg)
 
@@ -1542,23 +1568,7 @@ class HtmlPage:
 
     @staticmethod
     def show_playlist_data():
-        # Prefer global playlist created in __main__
-        pl_global = globals().get('playlist') if 'playlist' in globals() else None
-        playlist_items = pl_global.playlist if pl_global else None
-
-        # Fallback: build playlist via Playlist.create() using env URIs
-        if not playlist_items:
-            uris_env = os.environ.get('URI') or os.environ.get('URIS')
-            if uris_env:
-                # Split by common separators
-                for sep in ["|", " "]:
-                    uris_env = uris_env.replace(sep, " ")
-                uris_list = [u.strip() for u in uris_env.split() if u.strip()]
-                try:
-                    tmp_pl = Playlist(uris_list, 5, Theme('default'), [], None)
-                    playlist_items = tmp_pl.create(uris_list)
-                except Exception:
-                    playlist_items = None
+        playlist_items = get_playlist_items()
 
         if not playlist_items:
             return "<p>No playlist items available</p>"
@@ -1949,15 +1959,15 @@ if __name__ == "__main__":
     # Change view regularly
     display.start_time = time.time()
 
-    # Start ASGI server via Daphne
+    # Start ASGI server via uvicorn
     try:
-        cmd = ['daphne', '-b', listen_address, '-p', str(listen_port), 'controller:asgi_app']
-        logging.info(f"Starting Daphne ASGI server on {listen_address}:{listen_port}")
-        # Ensure the controller directory is importable so Daphne can import 'controller:asgi_app'
+        cmd = ['uvicorn', 'controller:asgi_app', '--host', listen_address, '--port', str(listen_port)]
+        logging.info(f"Starting uvicorn ASGI server on {listen_address}:{listen_port}")
+        # Ensure the controller directory is importable so uvicorn can import 'controller:asgi_app'
         module_dir = os.path.dirname(os.path.abspath(__file__))
         env_mod = os.environ.copy()
         env_mod['PYTHONPATH'] = module_dir + (os.pathsep + env_mod['PYTHONPATH'] if 'PYTHONPATH' in env_mod else '')
         subprocess.run(cmd, env=env_mod, check=False)
     except FileNotFoundError:
-        logging.error("Daphne not found. Install 'daphne' to run the ASGI server.")
+        logging.error("uvicorn not found. Install 'uvicorn' to run the ASGI server.")
         sys.exit(1)

@@ -22,9 +22,7 @@ dependencies = [
     "selenium>=4.36.0",
     "xkbcommon>=1.5.1",
     "git+https://github.com/bbusse/webdriver-util@main#egg=webdriver-util",
-    "asgiref>=3.11.0",
-    "daphne>=4.2.1",
-    "twisted[tls,http2]"
+    "uvicorn>=0.30.0"
 ]
 
 [build-system]
