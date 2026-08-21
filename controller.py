@@ -688,10 +688,10 @@ class Playlist:
         logging.info("Starting network view")
         texts = list()
         net = System.net_data(probe_ip_address)
-        texts.append(net["address"])
-        texts.append(net["addresses"])
-        texts.append(net["public_ip"])
-        texts.append(net["resolvconf"])
+        texts.append("Network Address " + str(net["address"]))
+        texts.append("Network Addresses " + str(net["addresses"]))
+        texts.append("Public IP" + str(net["public_ip"]))
+        texts.append("resolv.conf" + str(net["resolvconf"]))
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         for i in range(len(texts)):
             view.s_objects[i]["font_size"] = 20
