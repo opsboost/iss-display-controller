@@ -38,7 +38,11 @@ RUN /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
 
 # Minimal runtime on Alpine; ensure Python runtime libs present
 FROM alpine:edge
-RUN apk add --no-cache python3
+RUN apk add --no-cache \
+    python3 \
+    cairo \
+    pango \
+    libxkbcommon
 COPY --from=build-venv /venv /venv
 COPY . /controller
 WORKDIR /controller
