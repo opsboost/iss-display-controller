@@ -433,42 +433,48 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "mediaplayer"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("https://") and any(uri.rstrip('/').lower().endswith(s) for s in ('/rss', '/feed', '/atom', '.rss', '.atom', '.xml')):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "news"
+                item["news"] = News({"rss": uri, "db": ""})
+                item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("https://"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "browser"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-apod://"):
+            elif uri.startswith("iss://apod"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "apod"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-cal://"):
+            elif uri.startswith("iss://cal"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "calendar"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-clock://"):
+            elif uri.startswith("iss://clock"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "clock"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-mqtt://"):
+            elif uri.startswith("iss://mqtt"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "mqtt"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-music://"):
+            elif uri.startswith("iss://music"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "music"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-network://"):
+            elif uri.startswith("iss://network"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "network"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-news://"):
+            elif uri.startswith("iss://news"):
                 news_sources = {"hn" : "",
                                 "db" : "/home/mue/.local/share/russ/feeds.db"}
                 self.news = News(news_sources)
@@ -476,28 +482,33 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "news"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-otd://"):
+            elif uri.startswith("iss://otd"):
                 otd_sources = {"wikipedia" : ""}
                 self.otd = OTD(otd_sources)
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "onthisday"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-proc://"):
+            elif uri.startswith("iss://proc"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "processes"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-system://"):
+            elif uri.startswith("iss://system"):
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "system"
                 item["play_time_s"] = self.default_play_time_s
-            elif uri.startswith("iss-weather://"):
+            elif uri.startswith("iss://weather"):
                 self.weather = Weather(self.location)
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "weather"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss://playlist"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "playlist"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.endswith(".svg"):
                 download_file(uri.strip(), self.download_path)
@@ -559,12 +570,15 @@ class Playlist:
                                            probe_ip_address))
             elif item["player"] == "news":
                 x = threading.Thread(target=self.start_news_view,
-                                     args=(self.news,
+                                     args=(item.get("news") or self.news,
                                            self.theme.img_bg,))
             elif item["player"] == "onthisday":
                 x = threading.Thread(target=self.start_onthisday_view,
                                      args=(self.otd,
                                            self.theme.img_bg,))
+            elif item["player"] == "playlist":
+                x = threading.Thread(target=self.start_playlist_view,
+                                     args=(self.theme.img_bg,))
             elif item["player"] == "processes":
                 x = threading.Thread(target=self.start_proc_view,
                                      args=(self.theme.img_bg,))
@@ -688,19 +702,33 @@ class Playlist:
         logging.info("Starting network view")
         texts = list()
         net = System.net_data(probe_ip_address)
-        texts.append("Network Address " + str(net["address"]))
-        texts.append("Network Addresses " + str(net["addresses"]))
-        texts.append("Public IP" + str(net["public_ip"]))
-        texts.append("resolv.conf" + str(net["resolvconf"]))
+        texts.append("Network Address " + (net["address"] or ""))
+        texts.append("Network Addresses " + (net["addresses"] or ""))
+        texts.append("Public IP " + (net["public_ip"] or ""))
+        texts.append("resolv.conf\n" + (net["resolvconf"] or ""))
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         for i in range(len(texts)):
             view.s_objects[i]["font_size"] = 20
             view.s_objects[i]["alignment"] = "left"
         view.show_content(texts, img_bg)
 
+    def start_playlist_view(self, img_bg):
+        logging.info("Starting playlist view")
+        items = get_playlist_items()
+        if items:
+            lines = [f"{item['num']:>2}  {item['uri']:<40} {item['player']}" for item in items]
+            text = "\n".join(lines)
+        else:
+            text = "Playlist unavailable"
+        texts = [text]
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        view.show_content(texts, img_bg)
+
     def start_proc_view(self, img_bg):
         texts = list()
-        texts.append(System.list_processes(23))
+        texts.append(System.list_processes(23) or "Process list unavailable")
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 14
         view.s_objects[0]["alignment"] = "left"
@@ -721,12 +749,12 @@ class Playlist:
         else:
             texts.append(str(uptime_info))
         texts.append(f"Display started: {display.started}")
-        texts.append(sys["uptime"])
+        texts.append(sys["uptime"] or "")
         texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
-        texts.append(sys["data"])
-        texts.append(net["address"])
-        texts.append(net["addresses"])
-        texts.append(str(net["online_status"]) + " " + str(net["public_ip"]))
+        texts.append(sys["data"] or "")
+        texts.append(net["address"] or "")
+        texts.append(net["addresses"] or "")
+        texts.append((net["online_status"] or "") + " " + (net["public_ip"] or ""))
         texts.append(f"Listen address: {display.address}:{display.port}")
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         for i in range(len(texts)):
@@ -1892,7 +1920,8 @@ if __name__ == "__main__":
     logging.info(f"Using theme: {theme_name}")
     logging.info(f"URIs: {uris}")
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
-    logging.info(f"Playlist: {playlist}")
+    for item in playlist.playlist:
+        logging.info(f"Playlist item {item['num']}: {item['uri']} -> {item['player']}")
     threads = playlist.start_player(probe_ip_address)
     started = len(threads)
     expected = len(playlist.playlist)
