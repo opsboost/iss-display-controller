@@ -1184,7 +1184,7 @@ class Display:
 
         logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
-        self.set_workspace_layout()
+        self.float_new_windows()
 
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
@@ -1452,15 +1452,17 @@ class Display:
             logging.debug(f"active_window: failed to determine active window: {e}")
             return None
 
-    # Stacked windows are tiled but only the focused one is drawn,
-    # so switching focus shows exactly one window at full size
-    def set_workspace_layout(self, layout="stacking"):
+    # Float every window we spawn so they all share one stack,
+    # where focus raises a window to the top and hides the previous one.
+    # Tiled windows always draw below floating ones and would never show
+    def float_new_windows(self):
         try:
-            cmd = ['swaymsg', '-s', self.socket_path, 'layout', layout]
-            self.swaymsg_send_message(cmd, env=env, log_prefix="set_workspace_layout")
-            logging.info(f"display: Set workspace layout to {layout}")
+            cmd = ['swaymsg', '-s', self.socket_path,
+                   'for_window', '[app_id=".*"]', 'floating', 'enable']
+            self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
+            logging.info("display: Set new windows to float")
         except Exception as e:
-            logging.warning(f"display: Failed to set workspace layout: {e}")
+            logging.warning(f"display: Failed to set new windows to float: {e}")
 
     def focus_next_window(self, t_focus_s):
         while True:
