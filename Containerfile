@@ -17,7 +17,8 @@ LABEL org.label-schema.vcs-url="https://github.com/opsboost/iss-display-controll
 RUN apk add --no-cache \
     git \
     python3-dev \
-    build-base \
+    gcc \
+    musl-dev \
     libxkbcommon-dev \
     pkgconf && \
     python3 -m venv /venv && \
