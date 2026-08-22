@@ -1197,6 +1197,9 @@ class Wayland_view:
 
 class Display:
 
+    # The app_ids of the windows we spawn ourselves, the only ones we cycle
+    window_app_ids = ("iss-view", "firefox")
+
     def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
         self.port = port
@@ -1428,6 +1431,11 @@ class Display:
 
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
+        # The blacklist is a snapshot taken at startup, which races anything
+        # the compositor is still mapping, so match on what we spawn instead.
+        # Keeps the background and any foreign window out of the rotation
+        windows = [w for w in windows
+                   if w.get("app_id") in self.window_app_ids]
         logging.debug(f"display: {len(windows)} windows in whitelist")
 
         return windows
