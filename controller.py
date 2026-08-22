@@ -856,21 +856,23 @@ class Playlist:
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.show_content(texts, img_bg)
 
-    def start_news_view(self, news, img_bg):
-        texts = list()
-        item = news.news_item()
-        if not item:
-            texts.append("No news available")
-        else:
-            texts.append(item.get("feed", ""))
-            texts.append(item.get("title", ""))
-            texts.append(item.get("url", ""))
-        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+    def start_news_view(self, news, img_bg, refresh_interval_s=10):
+        def news_texts():
+            item = news.news_item()
+            if not item:
+                return ["No news available", "", ""]
+
+            return [item.get("feed", ""),
+                    item.get("title", ""),
+                    item.get("url", "")]
+
+        view = Wayland_view(display.res_x, display.res_y, 3, theme)
         view.s_objects[0]["font_size"] = 30
         view.s_objects[1]["font_size"] = 60
-        if len(texts) > 2:
-            view.s_objects[2]["font_size"] = 30
-        view.show_content(texts, img_bg)
+        view.s_objects[2]["font_size"] = 30
+        view.show_content(news_texts(), img_bg,
+                          refresh=news_texts,
+                          refresh_interval_s=refresh_interval_s)
 
     def start_onthisday_view(self, otd, img_bg):
         texts = list()
@@ -1018,6 +1020,39 @@ class Stream():
             ], env=env)
 
 
+# Timer for the wayland eventlist, which expects a nexttime attribute
+# and an alarm() method. Pulls the next set of texts and repaints,
+# so a window shows fresh content instead of whatever it spawned with
+class Content_refresh:
+
+    def __init__(self, wayland_view, window, refresh, interval_s, html_escape):
+        self.wayland_view = wayland_view
+        self.window = window
+        self.refresh = refresh
+        self.interval_s = interval_s
+        self.html_escape = html_escape
+        self.nexttime = time.time() + interval_s
+
+    def alarm(self):
+        self.nexttime = time.time() + self.interval_s
+
+        if self.window.surface.destroyed:
+            return
+
+        try:
+            texts = self.refresh()
+        except Exception as e:
+            logging.warning(f"view: Failed to refresh content: {e}")
+            return
+
+        if not texts:
+            return
+
+        self.wayland_view.set_texts(texts, self.html_escape)
+        if self.window.redraw_func:
+            self.window.redraw_func(self.window)
+
+
 class Wayland_view:
 
     def __init__(self, res_x, res_y, num_objects, theme):
@@ -1088,17 +1123,30 @@ class Wayland_view:
         self.conn.disconnect()
         logging.info(f"Exiting wayland view: {view.shutdowncode}")
 
-    def show_content(self, texts, img_bg=False, fullscreen=False, html_escape=True):
-        logging.info(f"view: Have {len(texts)} text block(s)")
-
+    def set_texts(self, texts, html_escape=True):
         n = 0
         for text in texts:
+            if n >= len(self.s_objects):
+                logging.debug(f"view: Ignoring text block {n}, "
+                              f"have {len(self.s_objects)} drawing object(s)")
+                break
             logging.debug(f"Showing text: {text}")
             if html_escape:
                 self.s_objects[n]["text"] = html.escape(str(text))
             else:
                 self.s_objects[n]["text"] = str(text)
             n += 1
+
+        # Clear any objects the new texts do not cover,
+        # so nothing lingers from the previous content
+        for i in range(n, len(self.s_objects)):
+            self.s_objects[i]["text"] = ""
+
+    def show_content(self, texts, img_bg=False, fullscreen=False, html_escape=True,
+                     refresh=None, refresh_interval_s=None):
+        logging.info(f"view: Have {len(texts)} text block(s)")
+
+        self.set_texts(texts, html_escape)
 
         # Log the s_objects for debugging
         for idx, obj in enumerate(self.s_objects):
@@ -1124,6 +1172,11 @@ class Wayland_view:
                         redraw=draw_function,
                         fullscreen=fullscreen,
                         class_="iss-view")
+
+        if refresh and refresh_interval_s:
+            view.eventlist.append(Content_refresh(self, w, refresh,
+                                                  refresh_interval_s, html_escape))
+            logging.info(f"view: Refreshing content every {refresh_interval_s}s")
 
         self.create_window(w)
 
@@ -1454,15 +1507,22 @@ class Display:
 
     # Float every window we spawn so they all share one stack,
     # where focus raises a window to the top and hides the previous one.
-    # Tiled windows always draw below floating ones and would never show
+    # Tiled windows always draw below floating ones and would never show.
+    # The views size themselves to the screen, the browser does not,
+    # so size its float to the whole output to match them. Sway fullscreen
+    # would draw above the stack and never give up the screen again
     def float_new_windows(self):
-        try:
-            cmd = ['swaymsg', '-s', self.socket_path,
-                   'for_window', '[app_id=".*"]', 'floating', 'enable']
-            self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
-            logging.info("display: Set new windows to float")
-        except Exception as e:
-            logging.warning(f"display: Failed to set new windows to float: {e}")
+        rules = [('[app_id=".*"]', ['floating', 'enable']),
+                 ('[app_id="firefox"]', ['resize', 'set', '100', 'ppt', '100', 'ppt'])]
+
+        for criteria, command in rules:
+            try:
+                cmd = ['swaymsg', '-s', self.socket_path,
+                       'for_window', criteria] + command
+                self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
+                logging.info(f"display: Added window rule {criteria} {' '.join(command)}")
+            except Exception as e:
+                logging.warning(f"display: Failed to add window rule {criteria}: {e}")
 
     def focus_next_window(self, t_focus_s):
         while True:
