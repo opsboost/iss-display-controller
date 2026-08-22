@@ -1072,6 +1072,7 @@ class Wayland_view:
                     "font_colour_b": 0,
                     "file": "",
                     "img_scale_up": True,
+                    "img_scale_down": True,
                     "text": list()}
 
         self.s_objects = list()
