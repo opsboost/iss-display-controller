@@ -63,10 +63,15 @@ PY
 # Minimal runtime; the interpreter is already there, so only the libraries
 # our extension modules link against are added
 FROM ${BASE_IMAGE}
+# xkeyboard-config comes in as a hard dependency of libxkbcommon, so it cannot
+# be removed with apk, but its data is only read to compile a keymap from
+# layout names. We compile the one the compositor hands us over an fd, so the
+# data goes in the same layer that installed it
 RUN apk add --no-cache \
     cairo \
     pango \
-    libxkbcommon
+    libxkbcommon && \
+    rm -rf /usr/share/X11 /usr/share/xkeyboard-config-2
 COPY --from=build-venv /venv /venv
 COPY . /controller
 WORKDIR /controller
