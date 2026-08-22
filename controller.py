@@ -1184,6 +1184,8 @@ class Display:
 
         logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
+        self.set_workspace_layout()
+
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
 
@@ -1449,6 +1451,16 @@ class Display:
         except Exception as e:
             logging.debug(f"active_window: failed to determine active window: {e}")
             return None
+
+    # Stacked windows are tiled but only the focused one is drawn,
+    # so switching focus shows exactly one window at full size
+    def set_workspace_layout(self, layout="stacking"):
+        try:
+            cmd = ['swaymsg', '-s', self.socket_path, 'layout', layout]
+            self.swaymsg_send_message(cmd, env=env, log_prefix="set_workspace_layout")
+            logging.info(f"display: Set workspace layout to {layout}")
+        except Exception as e:
+            logging.warning(f"display: Failed to set workspace layout: {e}")
 
     def focus_next_window(self, t_focus_s):
         while True:
