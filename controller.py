@@ -1507,22 +1507,15 @@ class Display:
 
     # Float every window we spawn so they all share one stack,
     # where focus raises a window to the top and hides the previous one.
-    # Tiled windows always draw below floating ones and would never show.
-    # The views size themselves to the screen, the browser does not,
-    # so size its float to the whole output to match them. Sway fullscreen
-    # would draw above the stack and never give up the screen again
+    # Tiled windows always draw below floating ones and would never show
     def float_new_windows(self):
-        rules = [('[app_id=".*"]', ['floating', 'enable']),
-                 ('[app_id="firefox"]', ['resize', 'set', '100', 'ppt', '100', 'ppt'])]
-
-        for criteria, command in rules:
-            try:
-                cmd = ['swaymsg', '-s', self.socket_path,
-                       'for_window', criteria] + command
-                self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
-                logging.info(f"display: Added window rule {criteria} {' '.join(command)}")
-            except Exception as e:
-                logging.warning(f"display: Failed to add window rule {criteria}: {e}")
+        try:
+            cmd = ['swaymsg', '-s', self.socket_path,
+                   'for_window', '[app_id=".*"]', 'floating', 'enable']
+            self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
+            logging.info("display: Set new windows to float")
+        except Exception as e:
+            logging.warning(f"display: Failed to set new windows to float: {e}")
 
     def focus_next_window(self, t_focus_s):
         while True:
@@ -1537,8 +1530,16 @@ class Display:
                     continue
 
             next_window = self.switching_windows.pop()
-            logging.info(f"display: Switching focus to: {next_window['id']}")
-            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'focus']
+            win_id = next_window['id']
+            logging.info(f"display: Switching focus to: {win_id}")
+            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]", 'focus']
+            self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
+
+            # Fullscreen the window we just focused, which drops fullscreen
+            # from the previous one. This gives the browser the whole output
+            # without its chrome, and makes stacking order irrelevant
+            cmd = ['swaymsg', '-s', self.socket_path,
+                   f"[con_id={win_id}]", 'fullscreen', 'enable']
             self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
 
     async def fullscreen_next_window(self):
