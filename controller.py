@@ -1199,6 +1199,8 @@ class Display:
 
     # The app_ids of the windows we spawn ourselves, the only ones we cycle
     window_app_ids = ("iss-view", "firefox")
+    # Every window we cycle gets a workspace to itself, named with this prefix
+    workspace_prefix = "iss-"
 
     def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
@@ -1240,7 +1242,7 @@ class Display:
 
         logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
-        self.float_new_windows()
+        self.set_window_rules()
 
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
@@ -1513,17 +1515,20 @@ class Display:
             logging.debug(f"active_window: failed to determine active window: {e}")
             return None
 
-    # Float every window we spawn so they all share one stack,
-    # where focus raises a window to the top and hides the previous one.
-    # Tiled windows always draw below floating ones and would never show
-    def float_new_windows(self):
+    # Float every window we spawn. Our views set a fixed size and ignore the
+    # size the compositor asks them to take, so tiling them, which resizes
+    # them to fill their workspace, leaves the buffer and the window disagreeing
+    def set_window_rules(self):
         try:
             cmd = ['swaymsg', '-s', self.socket_path,
                    'for_window', '[app_id=".*"]', 'floating', 'enable']
-            self.swaymsg_send_message(cmd, env=env, log_prefix="float_new_windows")
+            self.swaymsg_send_message(cmd, env=env, log_prefix="set_window_rules")
             logging.info("display: Set new windows to float")
         except Exception as e:
             logging.warning(f"display: Failed to set new windows to float: {e}")
+
+    def window_workspace(self, win_id):
+        return f"{self.workspace_prefix}{win_id}"
 
     def focus_next_window(self, t_focus_s):
         while True:
@@ -1540,14 +1545,18 @@ class Display:
             next_window = self.switching_windows.pop()
             win_id = next_window['id']
             logging.info(f"display: Switching focus to: {win_id}")
-            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]", 'focus']
+
+            # One window to a workspace, so showing the next one never asks any
+            # window to change size or state, only the compositor to show a
+            # different workspace. A window already there is left alone, and
+            # the browser needs no special case: its own fullscreen covers the
+            # workspace it is alone on
+            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]",
+                   'move', 'workspace', self.window_workspace(win_id)]
             self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
 
-            # Fullscreen the window we just focused, which drops fullscreen
-            # from the previous one. This gives the browser the whole output
-            # without its chrome, and makes stacking order irrelevant
-            cmd = ['swaymsg', '-s', self.socket_path,
-                   f"[con_id={win_id}]", 'fullscreen', 'enable']
+            # Focus follows the window, so sway switches to its workspace
+            cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]", 'focus']
             self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
 
     async def fullscreen_next_window(self):
