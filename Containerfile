@@ -1,4 +1,9 @@
-FROM alpine:edge AS build
+# moonshine-python carries CPython on musl with brush as the only shell.
+# Both stages use it, so the venv's compiled extension modules are built
+# against the same interpreter that ends up running them
+ARG BASE_IMAGE=ghcr.io/bbusse/moonshine-python:latest
+
+FROM ${BASE_IMAGE} AS build
 LABEL maintainer="Björn Busse <bj.rn@baerlin.eu>"
 LABEL org.opencontainers.image.source=https://github.com/opsboost/iss-display-controller
 LABEL org.label-schema.description="iss display controller"
@@ -6,12 +11,12 @@ LABEL org.label-schema.name="iss-display-controller"
 LABEL org.label-schema.schema-version="1.0"
 LABEL org.label-schema.vcs-url="https://github.com/opsboost/iss-display-controller"
 
-# Base build deps for compiling Python wheels if needed
+# Base build deps for compiling Python wheels if needed.
+# python3 comes from the base image, and seeds the venv's pip from its own
+# bundled ensurepip wheels, so the py3-pip package is not needed here either
 RUN apk add --no-cache \
     git \
-    python3 \
     python3-dev \
-    py3-pip \
     build-base \
     libxkbcommon-dev \
     pkgconf && \
@@ -36,10 +41,29 @@ RUN /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
                /venv/lib/python3.*/site-packages/distutils-precedence.pth \
                /venv/bin/pip*
 
-# Minimal runtime on Alpine; ensure Python runtime libs present
-FROM alpine:edge
+# Selenium Manager resolves a driver and a browser at run time. We pass both
+# explicitly and set SE_DISABLE_DRIVER_MANAGEMENT, so all three binaries are
+# dead weight, and the mac and windows ones could never run here anyway
+RUN rm -rf /venv/lib/python3.*/site-packages/selenium/webdriver/common/linux \
+           /venv/lib/python3.*/site-packages/selenium/webdriver/common/macos \
+           /venv/lib/python3.*/site-packages/selenium/webdriver/common/windows
+
+# Byte code is regenerated on first import. Keeping it would cost more in image
+# size than the one recompile costs at startup.
+# Done in python rather than with find, which the base image has no coreutils for
+RUN python3 <<'PY'
+import pathlib, shutil
+venv = pathlib.Path("/venv")
+for d in list(venv.rglob("__pycache__")):
+    shutil.rmtree(d, ignore_errors=True)
+for f in list(venv.rglob("*.pyc")):
+    f.unlink(missing_ok=True)
+PY
+
+# Minimal runtime; the interpreter is already there, so only the libraries
+# our extension modules link against are added
+FROM ${BASE_IMAGE}
 RUN apk add --no-cache \
-    python3 \
     cairo \
     pango \
     libxkbcommon
