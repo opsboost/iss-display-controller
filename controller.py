@@ -2,7 +2,7 @@
 import requests
 import asyncio
 import configargparse
-from doi.main import APOD, Calendar, MQTT, Music, News, OTD, System, Weather
+from doi import APOD, Calendar, MQTT, Music, News, OTD, RSSFeed, System, Weather
 import html
 import ipaddress
 import json
@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import threading
+import xml.etree.ElementTree as ET
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
 import wayland.protocol
@@ -33,6 +34,7 @@ import wayland.protocol
 # Suppress protocol.py INFO messages
 import logging
 logging.getLogger("wayland.protocol").setLevel(logging.WARNING)
+
 
 # Ensure child processes inherit the runtime environment (including PATH)
 env = os.environ.copy()
@@ -437,7 +439,7 @@ class Playlist:
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "news"
-                item["news"] = News({"rss": uri, "db": ""})
+                item["news"] = RSSFeed(uri)
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("https://"):
                 item["num"] = n
