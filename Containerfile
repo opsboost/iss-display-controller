@@ -24,13 +24,18 @@ RUN apk add --no-cache \
     python3 -m venv /venv && \
     /venv/bin/pip install --upgrade pip setuptools wheel
 
-# Build the virtualenv as a separate step: Only re-execute this step when requirements.txt changes
+# Build the virtualenv as a separate step: Only re-execute this step when
+# requirements.txt or DEPS_REF changes. requirements.txt pins git branches, so
+# it stays identical when those branches move; pass the branch heads as
+# DEPS_REF to rebuild the venv when a dependency changed
 FROM build AS build-venv
 
+ARG DEPS_REF=unpinned
 COPY requirements.txt /requirements.txt
 # pip/setuptools/wheel are build-time only; stripped here so the copied venv
 # never carries them into the final image's layer history
-RUN /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
+RUN printf '%s\n' "${DEPS_REF}" > /venv/deps-ref \
+    && /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
     && rm -rf /venv/lib/python3.*/site-packages/pip \
                /venv/lib/python3.*/site-packages/pip-*.dist-info \
                /venv/lib/python3.*/site-packages/setuptools \
