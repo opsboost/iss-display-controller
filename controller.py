@@ -593,6 +593,7 @@ class Playlist:
                                      args=(self.weather,
                                            self.theme.img_bg,))
 
+            x.playlist_item = item
             x.start()
             if not x.is_alive():
                 logging.error(f"Failed to start {item['player']}")
@@ -1084,10 +1085,11 @@ class Wayland_view:
                 sys.exit(1)
             raise
 
+        item = getattr(threading.current_thread(), "playlist_item", None)
         self.window = {}
         self.window["res_x"] = res_x
         self.window["res_y"] = res_y
-        self.window["title"] = "News"
+        self.window["title"] = f"{item['player']}-{item['num']}" if item else "iss-view"
 
         s_object = {"alignment": "center",
                     "offset_x": 10,
@@ -1211,6 +1213,7 @@ class Display:
         self.start_time = time.time()
         self.switching_windows = list()
         self.window_blacklist = list()
+        self.play_items = dict()
         self.screenshot_path = "/tmp"
         self.screenshot_file = "screenshot.png"
         self.socket_path = self.get_socket_path()
@@ -1243,9 +1246,6 @@ class Display:
         logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
         self.set_window_rules()
-
-        self.x = threading.Thread(target=self.focus_next_window, args=(3,))
-        self.x.start()
 
     def start_state_server(self, host=None, port=None):
         if host:
@@ -1530,21 +1530,59 @@ class Display:
     def window_workspace(self, win_id):
         return f"{self.workspace_prefix}{win_id}"
 
+    # Views title their window after the playlist item they were spawned for,
+    # which is how a window found in the tree is matched back to its item.
+    # The browser titles its own window, so it is matched on app_id instead
+    def set_playlist(self, playlist):
+        for item in playlist:
+            if item["player"] == "browser":
+                key = "firefox"
+            else:
+                key = f"{item['player']}-{item['num']}"
+            self.play_items[key] = item
+
+        logging.info(f"display: Tracking {len(self.play_items)} playlist items")
+
+    def window_item(self, window):
+        for key in (window.get("name"), window.get("app_id")):
+            if key in self.play_items:
+                return self.play_items[key]
+
+        return None
+
+    def window_play_time(self, window, default_s):
+        item = self.window_item(window)
+
+        return (item or {}).get("play_time_s") or default_s
+
+    # Sorted descending and popped from the end, so the rotation runs in
+    # playlist order and anything we cannot place in it comes last
+    def window_order(self, window):
+        item = self.window_item(window)
+
+        return (item is None, item["num"] if item else 0)
+
+    def start_window_switching(self, t_focus_s):
+        self.x = threading.Thread(target=self.focus_next_window,
+                                  args=(t_focus_s,))
+        self.x.start()
+
     def focus_next_window(self, t_focus_s):
         while True:
-            time.sleep(t_focus_s)
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
+                self.switching_windows.sort(key=self.window_order, reverse=True)
                 if len(self.switching_windows) == 0:
-                    logging.debug(
-                        f"display: Expected no windows but found {len(self.switching_windows)}"
-                    )
+                    logging.debug("display: Found no windows to switch to")
+                    time.sleep(t_focus_s)
 
                     continue
 
             next_window = self.switching_windows.pop()
             win_id = next_window['id']
-            logging.info(f"display: Switching focus to: {win_id}")
+            play_time_s = self.window_play_time(next_window, t_focus_s)
+            logging.info(f"display: Switching focus to: {win_id} "
+                         f"({next_window.get('name')}) for {play_time_s}s")
 
             # One window to a workspace, so showing the next one never asks any
             # window to change size or state, only the compositor to show a
@@ -1558,6 +1596,8 @@ class Display:
             # Focus follows the window, so sway switches to its workspace
             cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]", 'focus']
             self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
+
+            time.sleep(play_time_s)
 
     async def fullscreen_next_window(self):
         await asyncio.sleep(random.random() * 3)
@@ -2017,6 +2057,8 @@ if __name__ == "__main__":
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
     for item in playlist.playlist:
         logging.info(f"Playlist item {item['num']}: {item['uri']} -> {item['player']}")
+    display.set_playlist(playlist.playlist)
+    display.start_window_switching(5)
     threads = playlist.start_player(probe_ip_address)
     started = len(threads)
     expected = len(playlist.playlist)
