@@ -18,6 +18,7 @@ RUN apk add --no-cache \
     git \
     python3-dev \
     gcc \
+    binutils \
     musl-dev \
     jpeg-dev \
     zlib-dev \
@@ -57,16 +58,23 @@ RUN rm -rf /venv/lib/python3.*/site-packages/selenium/webdriver/common/linux \
            /venv/lib/python3.*/site-packages/selenium/webdriver/common/macos \
            /venv/lib/python3.*/site-packages/selenium/webdriver/common/windows
 
+# The devtools bindings speak the Chrome DevTools Protocol, which geckodriver
+# does not, so they are dead weight for a Firefox-only setup
+RUN rm -rf /venv/lib/python3.*/site-packages/selenium/webdriver/common/devtools
+
 # Byte code is regenerated on first import. Keeping it would cost more in image
 # size than the one recompile costs at startup.
 # Done in python rather than with find, which the base image has no coreutils for
 RUN python3 <<'PY'
-import pathlib, shutil
+import pathlib, shutil, subprocess
 venv = pathlib.Path("/venv")
 for d in list(venv.rglob("__pycache__")):
     shutil.rmtree(d, ignore_errors=True)
 for f in list(venv.rglob("*.pyc")):
     f.unlink(missing_ok=True)
+for so in list(venv.rglob("*.so")) + list(venv.rglob("*.so.*")):
+    if so.is_file() and not so.is_symlink():
+        subprocess.run(["strip", "--strip-unneeded", str(so)], check=False)
 PY
 
 # Minimal runtime; the interpreter is already there, so only the libraries
