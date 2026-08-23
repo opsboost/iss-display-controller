@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import threading
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
@@ -423,6 +424,28 @@ class Playlist:
         self.playlist = self.create(uris)
         self.uris = self.get_uris()
 
+    @staticmethod
+    def split_play_time(uri):
+        parts = urlsplit(uri)
+        if not parts.query:
+            return uri, None
+
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        kept = [(k, v) for k, v in query if k != "t"]
+        if len(kept) == len(query):
+            return uri, None
+
+        play_time_s = None
+        for k, v in query:
+            if k != "t":
+                continue
+            try:
+                play_time_s = int(v)
+            except ValueError:
+                logging.warning(f"playlist: Ignoring play time {v!r} in {uri}")
+
+        return urlunsplit(parts._replace(query=urlencode(kept))), play_time_s
+
     def create(self, uris):
         n = 0
         playlist = list()
@@ -430,6 +453,7 @@ class Playlist:
         for uri in uris:
             item = {}
             n += 1
+            uri, play_time_s = self.split_play_time(uri)
             if uri.endswith(".m3u8"):
                 item["num"] = n
                 item["uri"] = uri
@@ -527,6 +551,8 @@ class Playlist:
 
             # Append if we found a valid playlist item
             if "num" in item:
+                if play_time_s:
+                    item["play_time_s"] = play_time_s
                 playlist.append(item)
 
         return playlist
