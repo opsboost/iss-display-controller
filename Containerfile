@@ -19,6 +19,9 @@ RUN apk add --no-cache \
     python3-dev \
     gcc \
     musl-dev \
+    jpeg-dev \
+    zlib-dev \
+    libwebp-dev \
     libxkbcommon-dev \
     pkgconf && \
     python3 -m venv /venv && \
@@ -35,7 +38,7 @@ COPY requirements.txt /requirements.txt
 # pip/setuptools/wheel are build-time only; stripped here so the copied venv
 # never carries them into the final image's layer history
 RUN printf '%s\n' "${DEPS_REF}" > /venv/deps-ref \
-    && /venv/bin/pip install --disable-pip-version-check -r /requirements.txt \
+    && /venv/bin/pip install --disable-pip-version-check --no-binary Pillow -r /requirements.txt \
     && rm -rf /venv/lib/python3.*/site-packages/pip \
                /venv/lib/python3.*/site-packages/pip-*.dist-info \
                /venv/lib/python3.*/site-packages/setuptools \
@@ -76,6 +79,11 @@ FROM ${BASE_IMAGE}
 RUN apk add --no-cache \
     cairo \
     pango \
+    libjpeg-turbo \
+    zlib \
+    libwebp \
+    libwebpmux \
+    libwebpdemux \
     libxkbcommon && \
     rm -rf /usr/share/X11 /usr/share/xkeyboard-config-2
 COPY --from=build-venv /venv /venv
