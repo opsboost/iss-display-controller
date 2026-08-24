@@ -16,6 +16,7 @@ import socket
 import stat
 import subprocess
 from subprocess import Popen, PIPE
+import shlex
 import shutil
 import signal
 from starlette.applications import Starlette
@@ -26,7 +27,7 @@ import sys
 import tempfile
 import time
 import threading
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
@@ -46,7 +47,10 @@ cmds = {"clock":        "humanbeans_clock",
         "image_viewer": "imv",
         "media_player": "mpv",
         "screenshot":   "grim",
+        "servoshell":   "servoshell",
         "vju":          "vju"}
+
+browser_engines = ("servo", "firefox")
 
 draw_methods = ("python-wayland", "vju")
 
@@ -768,20 +772,27 @@ class Playlist:
 
     our_params = ("t", "enabled", "refresh", "method")
 
+    # The rest of the query is carried over as it was written rather than
+    # re-encoded, or a uri like windy's ?radar,50.5,9.8,5,m:e2BagII comes back
+    # percent encoded and with an = appended
     @classmethod
     def split_params(cls, uri):
         parts = urlsplit(uri)
         if not parts.query:
             return uri, {}
 
-        query = parse_qsl(parts.query, keep_blank_values=True)
-        kept = [(k, v) for k, v in query if k not in cls.our_params]
-        if len(kept) == len(query):
+        kept, params = [], {}
+        for segment in parts.query.split("&"):
+            key, sep, value = segment.partition("=")
+            if key in cls.our_params:
+                params[key] = unquote_plus(value) if sep else ""
+            else:
+                kept.append(segment)
+
+        if not params:
             return uri, {}
 
-        params = {k: v for k, v in query if k in cls.our_params}
-
-        return urlunsplit(parts._replace(query=urlencode(kept))), params
+        return urlunsplit(parts._replace(query="&".join(kept))), params
 
     @staticmethod
     def parse_play_time(params, uri):
@@ -1102,7 +1113,43 @@ class Playlist:
         logging.info("Starting APOD")
         draw_apod('wayland-view', center=center, img_bg=img_bg)
 
-    def start_browser(self, urls):
+    def start_browser(self, urls, engine=None):
+        engine = engine or os.environ.get("BROWSER_ENGINE", "servo")
+        if engine not in browser_engines:
+            logging.warning(f"Unknown browser engine {engine!r}, using servo")
+            engine = "servo"
+
+        if engine == "firefox":
+            cmd, env_mod = self.browser_firefox(urls)
+        else:
+            cmd, env_mod = self.browser_servo(urls)
+
+        # Kept rather than discarded, and in our own session, so the browser
+        # can be waited on, restarted and stopped like any other player
+        self.stop_browser()
+        self.browser = Popen(cmd,
+                             env=env_mod,
+                             shell=False,
+                             close_fds=True,
+                             encoding='utf8')
+        logging.info(f"Started {engine} as pid {self.browser.pid}: {' '.join(cmd)}")
+
+        return True
+
+    # servoshell renders the page itself, with no driver in between. It cannot
+    # be scripted, so a page needing a login wants the firefox engine
+    @staticmethod
+    def browser_servo(urls):
+        cmd = [cmds["servoshell"]]
+        cmd += shlex.split(os.environ.get("BROWSER_ARGS", ""))
+        cmd += list(urls[:1])
+
+        return cmd, env.copy()
+
+    # Driven through geckodriver by webdriver_util, which is what can fill in
+    # a login form and cycle tabs
+    @staticmethod
+    def browser_firefox(urls):
         cmd = [sys.executable, '-m', 'webdriver_util']
         for url in urls:
             cmd.append("--url")
@@ -1114,17 +1161,7 @@ class Playlist:
         env_mod['GECKODRIVER'] = env_mod.get('GECKODRIVER', '/usr/bin/geckodriver')
         env_mod['FIREFOX_BIN'] = env_mod.get('FIREFOX_BIN', '/usr/bin/firefox')
 
-        # Kept rather than discarded, and in our own session, so the browser
-        # can be waited on, restarted and stopped like any other player
-        self.stop_browser()
-        self.browser = Popen(cmd,
-                             env=env_mod,
-                             shell=False,
-                             close_fds=True,
-                             encoding='utf8')
-        logging.info(f"Started browser as pid {self.browser.pid}")
-
-        return True
+        return cmd, env_mod
 
     def browser_running(self):
         return self.browser is not None and self.browser.poll() is None
@@ -1382,16 +1419,13 @@ class Playlist:
         if uv_index:
             texts.append(f"UV Index {uv_index}")
 
-        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.s_objects[0]["font_size"] = 80
-        view.s_objects[0]["alignment"] = "left"
-        view.s_objects[1]["font_size"] = 40
-        view.s_objects[1]["alignment"] = "left"
-        view.s_objects[2]["font_size"] = 20
-        view.s_objects[2]["alignment"] = "left"
-        # Optionally set font size/alignment for extra lines
-        for i in range(3, len(texts)):
-            view.s_objects[i]["font_size"] = 20
+        # Sized for the headline lines even when the fetch came back short,
+        # so a failed lookup does not index past the drawing objects
+        font_sizes = [80, 40, 20]
+        view = Wayland_view(display.res_x, display.res_y,
+                            max(len(texts), len(font_sizes)), theme)
+        for i in range(len(view.s_objects)):
+            view.s_objects[i]["font_size"] = font_sizes[min(i, len(font_sizes) - 1)]
             view.s_objects[i]["alignment"] = "left"
 
         view.show_content(texts, img_bg)
@@ -1796,7 +1830,8 @@ class Wayland_view:
 class Display:
 
     # The app_ids of the windows we spawn ourselves, the only ones we cycle
-    window_app_ids = ("iss-view", "firefox")
+    browser_app_ids = ("firefox", "org.servo.Servo", "servoshell", "servo")
+    window_app_ids = ("iss-view",) + browser_app_ids
     # Every window we cycle gets a workspace to itself, named with this prefix
     workspace_prefix = "iss-"
     # Where the state server binds and where its clients look for it
@@ -2311,10 +2346,13 @@ class Display:
         self.playlist = playlist
         for item in playlist.playlist:
             if item["player"] == "browser":
-                key = "firefox"
-            else:
-                key = f"{item['player']}-{item['num']}"
-            self.play_items[key] = item
+                # The engine decides the app_id, so every one it could be maps
+                # back to this item
+                for key in self.browser_app_ids:
+                    self.play_items[key] = item
+                continue
+
+            self.play_items[f"{item['player']}-{item['num']}"] = item
 
         logging.info(f"display: Tracking {len(self.play_items)} playlist items")
 
@@ -2457,7 +2495,8 @@ class Display:
             return {"error": f"no player for {uri}"}
 
         if item["player"] == "browser":
-            self.play_items["firefox"] = item
+            for key in self.browser_app_ids:
+                self.play_items[key] = item
         else:
             self.play_items[f"{item['player']}-{item['num']}"] = item
 
