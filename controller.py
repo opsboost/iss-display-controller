@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import requests
-import asyncio
+import collections
 import configargparse
 from doi import APOD, Calendar, MQTT, Music, News, OTD, RSSFeed, System, Weather
 import html
@@ -11,7 +11,6 @@ from logging import DEBUG
 import os
 from pathlib import Path
 import platform
-import random
 import re
 import socket
 import stat
@@ -20,8 +19,9 @@ from subprocess import Popen, PIPE
 import shutil
 import signal
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
-from starlette.routing import Route
+from starlette.routing import Match, Route
 import sys
 import tempfile
 import time
@@ -47,6 +47,110 @@ cmds = {"clock":        "humanbeans_clock",
         "media_player": "mpv",
         "screenshot":   "grim"}
 
+
+metric_meta = {
+    "iss_display_build_info": ("gauge", "Build and dependency identity, always 1"),
+    "iss_display_start_time_seconds": ("gauge", "Unix time the display started"),
+    "iss_display_views_running": ("gauge", "View windows currently drawing"),
+    "iss_display_surface_commits_total": ("counter", "Surface commits submitted"),
+    "iss_display_frames_presented_total": ("counter", "Frames the compositor presented"),
+    "iss_display_view_exits_total": ("counter", "View windows that stopped, by reason"),
+    "iss_display_window_switches_total": ("counter", "Focus switches performed"),
+    "iss_display_item_shown_seconds_total": ("counter", "Seconds each item was on screen"),
+    "iss_display_item_enabled": ("gauge", "Whether a playlist item is enabled"),
+    "iss_display_item_play_time_seconds": ("gauge", "Configured play time per item"),
+    "iss_display_windows": ("gauge", "Windows known to the compositor, by state"),
+    "iss_display_content_age_seconds": ("gauge", "Age of the content a view is showing"),
+    "iss_display_content_ticks_total": ("counter", "Refresh timer ticks handled"),
+    "iss_display_content_refreshes_total": ("counter", "Content refreshes that redrew"),
+    "iss_display_fetch_failures_total": ("counter", "Upstream fetches that failed, by source"),
+    "iss_display_rss_items": ("gauge", "Items parsed from an RSS feed"),
+    "iss_display_swaymsg_errors_total": ("counter", "swaymsg calls that wrote to stderr"),
+    "iss_display_state_commands_total": ("counter", "State socket commands served"),
+    "iss_display_browser_up": ("gauge", "Whether a browser window is present"),
+    "iss_display_http_requests_total": ("counter", "Requests handled, by route path"),
+    "iss_display_http_request_duration_seconds": ("summary", "Time spent handling requests"),
+    "iss_display_screenshot_failures_total": ("counter", "Screenshot captures that failed"),
+}
+
+class Metrics:
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.counters = collections.defaultdict(int)
+        self.gauges = {}
+
+    @staticmethod
+    def key(name, labels):
+        return (name, tuple(sorted((str(k), str(v)) for k, v in labels.items())))
+
+    def inc(self, name, value=1, **labels):
+        with self.lock:
+            self.counters[self.key(name, labels)] += value
+
+    def set(self, name, value, **labels):
+        with self.lock:
+            self.gauges[self.key(name, labels)] = value
+
+    def clear_gauge(self, name):
+        with self.lock:
+            for key in [k for k in self.gauges if k[0] == name]:
+                del self.gauges[key]
+
+    def snapshot(self):
+        with self.lock:
+            return {"counters": [[k[0], list(k[1]), v] for k, v in self.counters.items()],
+                    "gauges": [[k[0], list(k[1]), v] for k, v in self.gauges.items()]}
+
+    def merge(self, snapshot):
+        for name, labels, value in (snapshot or {}).get("counters", []):
+            with self.lock:
+                self.counters[(name, tuple(tuple(l) for l in labels))] += value
+        for name, labels, value in (snapshot or {}).get("gauges", []):
+            with self.lock:
+                self.gauges[(name, tuple(tuple(l) for l in labels))] = value
+
+metrics = Metrics()
+live_views = []
+live_views_lock = threading.Lock()
+last_content_refresh = {}
+last_content_refresh_lock = threading.Lock()
+
+def escape_metric_label(value):
+    return (str(value).replace("\\", "\\\\")
+                      .replace('"', '\\"')
+                      .replace("\n", "\\n"))
+
+def metric_family(name):
+    for suffix in ("_sum", "_count"):
+        if name.endswith(suffix):
+            base = name[:-len(suffix)]
+            if metric_meta.get(base, ("", ""))[0] in ("summary", "histogram"):
+                return base
+
+    return name
+
+def render_metrics(*sources):
+    families = collections.defaultdict(list)
+    for source in sources:
+        for kind in ("counters", "gauges"):
+            for name, labels, value in (source or {}).get(kind, []):
+                families[metric_family(name)].append(
+                    (name, tuple(tuple(l) for l in labels), value))
+
+    lines = []
+    for family in sorted(families):
+        kind, help_text = metric_meta.get(family, ("untyped", family))
+        lines.append(f"# HELP {family} {help_text}")
+        lines.append(f"# TYPE {family} {kind}")
+        for name, labels, value in sorted(families[family]):
+            if labels:
+                rendered = ",".join(f'{k}="{escape_metric_label(v)}"' for k, v in labels)
+                lines.append(f"{name}{{{rendered}}} {value}")
+            else:
+                lines.append(f"{name} {value}")
+
+    return "\n".join(lines) + "\n"
 
 def web_main(request):
     return HTMLResponse(HtmlPage.page_display())
@@ -75,6 +179,10 @@ def get_playlist_items():
     pl_global = globals().get('playlist') if 'playlist' in globals() else None
     if pl_global:
         return pl_global.playlist
+
+    live = Display.query_playlist()
+    if live:
+        return live
 
     uris_env = os.environ.get('URI') or os.environ.get('URIS')
     if not uris_env:
@@ -112,6 +220,7 @@ def display_screenshot(request):
     fn = screenshot()
     if not fn or not os.path.exists(fn):
         logging.error(f"screenshot: capture failed or file does not exist")
+        metrics.inc("iss_display_screenshot_failures_total")
         return PlainTextResponse("Not Found", status_code=404)
     return FileResponse(fn, media_type='image/png')
 
@@ -150,6 +259,134 @@ def list_routes(app_instance=None):
 def api_routes(request):
     return JSONResponse(list_routes())
 
+# Counted by the route's own path, not the requested one, so path parameters
+# stay grouped and an unmatched request cannot add a key of its choosing
+request_counts = collections.Counter()
+request_counts_lock = threading.Lock()
+
+def counted_path(scope):
+    for route in app.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return getattr(route, "path", scope.get("path", ""))
+
+    return "<unmatched>"
+
+class RequestCounter:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+
+            return
+
+        path = counted_path(scope)
+        with request_counts_lock:
+            request_counts[path] += 1
+        metrics.inc("iss_display_http_requests_total", path=path)
+        started = time.time()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            metrics.inc("iss_display_http_request_duration_seconds_sum",
+                        time.time() - started, path=path)
+            metrics.inc("iss_display_http_request_duration_seconds_count", path=path)
+
+def api_requests(request):
+    with request_counts_lock:
+        counts = dict(request_counts)
+
+    return JSONResponse({"total": sum(counts.values()),
+                         "paths": dict(sorted(counts.items()))})
+
+def api_metrics(request):
+    body = render_metrics(metrics.snapshot(), Display.query_metrics())
+
+    return PlainTextResponse(body,
+                             media_type="text/plain; version=0.0.4; charset=utf-8")
+
+def api_resolution(request):
+    mode = request.path_params.get("mode")
+    display_global = globals().get('display') if 'display' in globals() else None
+    if display_global:
+        return JSONResponse(display_global.set_resolution(mode))
+
+    reply = Display.set_output_resolution(mode)
+    if reply is None:
+        return JSONResponse({"error": "display not reachable"}, status_code=503)
+
+    return JSONResponse(reply)
+
+def api_settings(request):
+    name = request.query_params.get("name")
+    default_time = request.query_params.get("default_time")
+    display_global = globals().get('display') if 'display' in globals() else None
+
+    result = {}
+    for value, local, remote in ((name, "set_playlist_name", "set_name"),
+                                 (default_time, "set_default_play_time", "set_default_time")):
+        if value is None:
+            continue
+        if display_global:
+            reply = getattr(display_global, local)(value)
+        else:
+            reply = getattr(Display, remote)(value)
+        if reply is None:
+            return JSONResponse({"error": "display not reachable"}, status_code=503)
+        result.update(reply)
+
+    if not result:
+        return JSONResponse({"error": "nothing to set"}, status_code=400)
+
+    return JSONResponse(result)
+
+def api_step(step):
+    display_global = globals().get('display') if 'display' in globals() else None
+    if display_global:
+        return JSONResponse(display_global.step_rotation(step))
+
+    reply = Display.step(step)
+    if reply is None:
+        return JSONResponse({"error": "display not reachable"}, status_code=503)
+
+    return JSONResponse(reply)
+
+def api_next(request):
+    return api_step(1)
+
+def api_previous(request):
+    return api_step(-1)
+
+def api_playlist_add(request):
+    uri = request.query_params.get("uri")
+    play_time_s = request.query_params.get("t")
+    if uri and play_time_s and "t=" not in urlsplit(uri).query:
+        joiner = "&" if urlsplit(uri).query else "?"
+        uri = f"{uri}{joiner}t={play_time_s}"
+    display_global = globals().get('display') if 'display' in globals() else None
+    if display_global:
+        return JSONResponse(display_global.add_playlist_item(uri))
+
+    reply = Display.add_item(uri)
+    if reply is None:
+        return JSONResponse({"error": "display not reachable"}, status_code=503)
+
+    return JSONResponse(reply)
+
+def api_playlist_toggle(request):
+    num = request.path_params.get("num")
+    pl_global = globals().get('display') if 'display' in globals() else None
+    if pl_global:
+        return JSONResponse(pl_global.toggle_playlist_item(num))
+
+    reply = Display.toggle_item(num)
+    if reply is None:
+        return JSONResponse({"error": "display not reachable"}, status_code=503)
+
+    return JSONResponse(reply)
+
 def probe_liveness():
     return "OK"
 
@@ -163,7 +400,18 @@ app = Starlette(routes=[
     Route("/screenshot", display_screenshot, methods=["GET"], name="screenshot"),
     Route("/api/v1/screenshot", api_screenshot, methods=["GET"], name="api_screenshot"),
     Route("/api/v1/routes", api_routes, methods=["GET"], name="api_routes"),
-])
+    Route("/api/v1/settings", api_settings, methods=["POST"], name="api_settings"),
+    Route("/api/v1/next", api_next, methods=["POST"], name="api_next"),
+    Route("/api/v1/previous", api_previous, methods=["POST"], name="api_previous"),
+    Route("/api/v1/playlist", api_playlist_add,
+          methods=["POST"], name="api_playlist_add"),
+    Route("/api/v1/playlist/{num:int}/toggle", api_playlist_toggle,
+          methods=["POST"], name="api_playlist_toggle"),
+    Route("/api/v1/requests", api_requests, methods=["GET"], name="api_requests"),
+    Route("/api/v1/resolution/{mode}", api_resolution,
+          methods=["POST"], name="api_resolution"),
+    Route("/metrics", api_metrics, methods=["GET"], name="metrics"),
+], middleware=[Middleware(RequestCounter)])
 asgi_app = app
 
 
@@ -242,6 +490,7 @@ def draw_apod(output='terminal', center=False, img_bg=False):
     img_path, desc = apod.apod_data()
     if not img_path or not desc:
         logging.error("Failed to fetch APOD data.")
+        metrics.inc("iss_display_fetch_failures_total", source="apod")
         return
 
     if output == 'terminal':
@@ -249,7 +498,7 @@ def draw_apod(output='terminal', center=False, img_bg=False):
     elif output == 'wayland-view':
         wv = Wayland_view(display.res_x, display.res_y, 1, theme)
         wv.s_objects[0]["font_size"] = 20
-        wv.s_objects[0]["alignment"] = "left"
+        wv.s_objects[0]["alignment"] = "center"
         wv.show_image(img_path)
 
 def draw_calendar(output='terminal', view_x_res=None, center=False, img_bg=False):
@@ -411,8 +660,10 @@ class Playlist:
                  default_play_time_s,
                  theme,
                  topics,
-                 location=None):
+                 location=None,
+                 name=""):
 
+        self.name = name
         self.download_path = "/tmp/"
         self.location = location
         self.default_play_time_s = default_play_time_s
@@ -420,31 +671,53 @@ class Playlist:
         self.theme = theme
         self.topics = topics or []
 
+        self.probe_ip_address = None
         self.playlist = list()
         self.playlist = self.create(uris)
         self.uris = self.get_uris()
 
-    @staticmethod
-    def split_play_time(uri):
+    our_params = ("t", "enabled")
+
+    @classmethod
+    def split_params(cls, uri):
         parts = urlsplit(uri)
         if not parts.query:
-            return uri, None
+            return uri, {}
 
         query = parse_qsl(parts.query, keep_blank_values=True)
-        kept = [(k, v) for k, v in query if k != "t"]
+        kept = [(k, v) for k, v in query if k not in cls.our_params]
         if len(kept) == len(query):
-            return uri, None
+            return uri, {}
 
-        play_time_s = None
-        for k, v in query:
-            if k != "t":
-                continue
-            try:
-                play_time_s = int(v)
-            except ValueError:
-                logging.warning(f"playlist: Ignoring play time {v!r} in {uri}")
+        params = {k: v for k, v in query if k in cls.our_params}
 
-        return urlunsplit(parts._replace(query=urlencode(kept))), play_time_s
+        return urlunsplit(parts._replace(query=urlencode(kept))), params
+
+    @staticmethod
+    def parse_play_time(params, uri):
+        if "t" not in params:
+            return None
+        try:
+            return int(params["t"])
+        except ValueError:
+            logging.warning(f"playlist: Ignoring play time {params['t']!r} in {uri}")
+
+            return None
+
+    @staticmethod
+    def parse_enabled(params, uri):
+        if "enabled" not in params:
+            return True
+
+        value = params["enabled"].strip().lower()
+        if value in ("true", "yes", "1", ""):
+            return True
+        if value in ("false", "no", "0"):
+            return False
+
+        logging.warning(f"playlist: Ignoring enabled {params['enabled']!r} in {uri}")
+
+        return True
 
     def create(self, uris):
         n = 0
@@ -453,7 +726,9 @@ class Playlist:
         for uri in uris:
             item = {}
             n += 1
-            uri, play_time_s = self.split_play_time(uri)
+            uri, params = self.split_params(uri)
+            play_time_s = self.parse_play_time(params, uri)
+            enabled = self.parse_enabled(params, uri)
             if uri.endswith(".m3u8"):
                 item["num"] = n
                 item["uri"] = uri
@@ -495,6 +770,11 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "music"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss://network-sockets"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "sockets"
+                item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss://network"):
                 item["num"] = n
                 item["uri"] = uri
@@ -519,6 +799,11 @@ class Playlist:
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "processes"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss://top"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "top"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss://system"):
                 item["num"] = n
@@ -551,11 +836,31 @@ class Playlist:
 
             # Append if we found a valid playlist item
             if "num" in item:
+                item["play_time_explicit"] = bool(play_time_s)
                 if play_time_s:
                     item["play_time_s"] = play_time_s
+                item["enabled"] = enabled
                 playlist.append(item)
 
         return playlist
+
+    def set_default_play_time(self, play_time_s):
+        self.default_play_time_s = play_time_s
+        for item in self.playlist:
+            if not item.get("play_time_explicit"):
+                item["play_time_s"] = play_time_s
+
+    def add(self, uri):
+        items = self.create([uri])
+        if not items:
+            return None
+
+        item = items[0]
+        item["num"] = max((i["num"] for i in self.playlist), default=0) + 1
+        self.playlist.append(item)
+        self.uris = self.get_uris()
+
+        return item
 
     def get_uris(self):
         uris = []
@@ -564,69 +869,96 @@ class Playlist:
         return uris
 
     def start_player(self, probe_ip_address):
+        self.probe_ip_address = probe_ip_address
         threads = list()
         for item in self.playlist:
-            if item["player"] == "apod":
-                x = threading.Thread(target=self.start_apod,
-                                     args=())
-            elif item["player"] == "browser":
-                # start_browser() wants a list
-                # but we want to start an instance for each URL
-                urls = list()
-                urls.append(item["uri"])
-                x = threading.Thread(target=self.start_browser,
-                                     args=(urls,))
-            elif item["player"] == "calendar":
-                x = threading.Thread(target=self.start_calendar,
-                                     args=())
-            elif item["player"] == "clock":
-                x = threading.Thread(target=self.start_clock,
-                                     args=())
-            elif item["player"] == "imageviewer":
-                x = threading.Thread(target=self.start_image_view,
-                                     args=(item["uri"],))
-            elif item["player"] == "mqtt":
-                x = threading.Thread(target=self.start_mqtt_views,
-                                     args=(self.topics,
-                                           self.theme,))
-            elif item["player"] == "music":
-                x = threading.Thread(target=self.start_music_view,
-                                     args=(self.theme.img_bg,))
-            elif item["player"] == "network":
-                x = threading.Thread(target=self.start_net_view,
-                                     args=(self.theme.img_bg,
-                                           probe_ip_address))
-            elif item["player"] == "news":
-                x = threading.Thread(target=self.start_news_view,
-                                     args=(item.get("news") or self.news,
-                                           self.theme.img_bg,))
-            elif item["player"] == "onthisday":
-                x = threading.Thread(target=self.start_onthisday_view,
-                                     args=(self.otd,
-                                           self.theme.img_bg,))
-            elif item["player"] == "playlist":
-                x = threading.Thread(target=self.start_playlist_view,
-                                     args=(self.theme.img_bg,))
-            elif item["player"] == "processes":
-                x = threading.Thread(target=self.start_proc_view,
-                                     args=(self.theme.img_bg,))
-            elif item["player"] == "system":
-                x = threading.Thread(target=self.start_sys_view,
-                                     args=(self.theme.img_bg,
-                                           probe_ip_address))
-            elif item["player"] == "weather":
-                x = threading.Thread(target=self.start_weather_view,
-                                     args=(self.weather,
-                                           self.theme.img_bg,))
+            if not item.get("enabled", True):
+                logging.info(f"Skipping disabled item {item['num']}: {item['uri']}")
+                continue
 
-            x.playlist_item = item
-            x.start()
-            if not x.is_alive():
-                logging.error(f"Failed to start {item['player']}")
-            else:
+            x = self.start_item(item)
+            if x:
                 threads.append(x)
 
         return threads
+
+    def start_item(self, item, probe_ip_address=None):
+        probe_ip_address = probe_ip_address or self.probe_ip_address
+        x = None
+        if item["player"] == "apod":
+            x = threading.Thread(target=self.start_apod,
+                                 args=())
+        elif item["player"] == "browser":
+            # start_browser() wants a list
+            # but we want to start an instance for each URL
+            urls = list()
+            urls.append(item["uri"])
+            x = threading.Thread(target=self.start_browser,
+                                 args=(urls,))
+        elif item["player"] == "calendar":
+            x = threading.Thread(target=self.start_calendar,
+                                 args=())
+        elif item["player"] == "clock":
+            x = threading.Thread(target=self.start_clock,
+                                 args=())
+        elif item["player"] == "imageviewer":
+            x = threading.Thread(target=self.start_image_view,
+                                 args=(item["uri"],))
+        elif item["player"] == "mqtt":
+            x = threading.Thread(target=self.start_mqtt_views,
+                                 args=(self.topics,
+                                       self.theme,))
+        elif item["player"] == "music":
+            x = threading.Thread(target=self.start_music_view,
+                                 args=(self.theme.img_bg,))
+        elif item["player"] == "network":
+            x = threading.Thread(target=self.start_net_view,
+                                 args=(self.theme.img_bg,
+                                       probe_ip_address))
+        elif item["player"] == "news":
+            x = threading.Thread(target=self.start_news_view,
+                                 args=(item.get("news") or self.news,
+                                       self.theme.img_bg,))
+        elif item["player"] == "onthisday":
+            x = threading.Thread(target=self.start_onthisday_view,
+                                 args=(self.otd,
+                                       self.theme.img_bg,))
+        elif item["player"] == "playlist":
+            x = threading.Thread(target=self.start_playlist_view,
+                                 args=(self.theme.img_bg,))
+        elif item["player"] == "processes":
+            x = threading.Thread(target=self.start_proc_view,
+                                 args=(self.theme.img_bg,))
+        elif item["player"] == "sockets":
+            x = threading.Thread(target=self.start_sockets_view,
+                                 args=(self.theme.img_bg,))
+        elif item["player"] == "top":
+            x = threading.Thread(target=self.start_top_view,
+                                 args=(self.theme.img_bg,))
+        elif item["player"] == "system":
+            x = threading.Thread(target=self.start_sys_view,
+                                 args=(self.theme.img_bg,
+                                       probe_ip_address))
+        elif item["player"] == "weather":
+            x = threading.Thread(target=self.start_weather_view,
+                                 args=(self.weather,
+                                       self.theme.img_bg,))
+
+        if x is None:
+            logging.warning(f"No player for {item['player']}, item {item['num']}")
+
+            return None
+
+        x.playlist_item = item
+        x.start()
+        if not x.is_alive():
+            logging.error(f"Failed to start {item['player']}")
+
+            return None
+
+        item["started"] = True
+
+        return x
 
     def start_apod(self, center=False, img_bg=False):
         logging.info("Starting APOD")
@@ -741,11 +1073,29 @@ class Playlist:
             view.s_objects[i]["alignment"] = "left"
         view.show_content(texts, img_bg)
 
+    def start_sockets_view(self, img_bg):
+        logging.info("Starting sockets view")
+        texts = [System.net_sockets(20) or "No sockets"]
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        view.show_content(texts, img_bg)
+
+    def start_top_view(self, img_bg):
+        logging.info("Starting top view")
+        texts = [System.top(20) or "No process data"]
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        view.show_content(texts, img_bg)
+
     def start_playlist_view(self, img_bg):
         logging.info("Starting playlist view")
         items = get_playlist_items()
         if items:
             lines = [f"{item['num']:>2}  {item['uri']:<40} {item['player']}" for item in items]
+            if self.name:
+                lines.insert(0, f"{self.name}\n")
             text = "\n".join(lines)
         else:
             text = "Playlist unavailable"
@@ -887,10 +1237,17 @@ class Playlist:
         def news_texts():
             item = news.news_item()
             if not item:
+                metrics.inc("iss_display_fetch_failures_total", source="news")
                 return ["No news available", "", ""]
 
+            if hasattr(news, "item_count"):
+                metrics.set("iss_display_rss_items", news.item_count(),
+                            feed=item.get("feed", "") or "unknown")
+            rank = item.get("rank")
+            title = item.get("title", "")
+
             return [item.get("feed", ""),
-                    item.get("title", ""),
+                    f"#{rank} {title}" if rank else title,
                     item.get("url", "")]
 
         view = Wayland_view(display.res_x, display.res_y, 3, theme)
@@ -1053,15 +1410,29 @@ class Stream():
 class Content_refresh:
 
     def __init__(self, wayland_view, window, refresh, interval_s, html_escape):
+        item = getattr(threading.current_thread(), "playlist_item", None)
+        self.source = item["player"] if item else "unknown"
         self.wayland_view = wayland_view
         self.window = window
         self.refresh = refresh
         self.interval_s = interval_s
         self.html_escape = html_escape
         self.nexttime = time.time() + interval_s
+        self.lock = threading.Lock()
+        self.last_texts = None
 
     def alarm(self):
-        self.nexttime = time.time() + self.interval_s
+        # Every view thread runs the shared eventlist, so a timer that comes
+        # due is alarmed by all of them. Without this only one caller advances
+        # the deadline, the rest would each pull another item and repaint the
+        # same surface, leaving several items composited onto one view
+        with self.lock:
+            now = time.time()
+            if now < self.nexttime:
+                return
+            self.nexttime = now + self.interval_s
+
+        metrics.inc("iss_display_content_ticks_total", player=self.source)
 
         if self.window.surface.destroyed:
             return
@@ -1070,11 +1441,16 @@ class Content_refresh:
             texts = self.refresh()
         except Exception as e:
             logging.warning(f"view: Failed to refresh content: {e}")
+            metrics.inc("iss_display_fetch_failures_total", source=self.source)
             return
 
-        if not texts:
+        if not texts or texts == self.last_texts:
             return
 
+        self.last_texts = list(texts)
+        metrics.inc("iss_display_content_refreshes_total", player=self.source)
+        with last_content_refresh_lock:
+            last_content_refresh[self.source] = time.time()
         self.wayland_view.set_texts(texts, self.html_escape)
         if self.window.redraw_func:
             self.window.redraw_func(self.window)
@@ -1144,12 +1520,33 @@ class Wayland_view:
             self.s_objects.append(s_object.copy())
 
     def create_window(self, w):
-        view.eventloop()
+        metrics.inc("iss_display_views_running")
+        with live_views_lock:
+            live_views.append((self.conn, w))
+        reason = "clean"
+        try:
+            self.conn.eventloop()
+        except view.connection_lost as e:
+            reason = "connection_lost"
+            logging.info(f"view: Compositor connection lost: {e!r}")
+        except Exception:
+            reason = "error"
+            raise
+        finally:
+            with live_views_lock:
+                for entry in [e for e in live_views if e[0] is self.conn]:
+                    live_views.remove(entry)
+            metrics.inc("iss_display_views_running", -1)
+            metrics.inc("iss_display_view_exits_total", reason=reason)
 
-        w.close()
-        self.conn.display.roundtrip()
-        self.conn.disconnect()
-        logging.info(f"Exiting wayland view: {view.shutdowncode}")
+        try:
+            w.close()
+            self.conn.display.roundtrip()
+            self.conn.disconnect()
+        except (*view.connection_lost, OSError) as e:
+            logging.info(f"view: Connection already gone, skipping teardown: {e!r}")
+
+        logging.info(f"Exiting wayland view: {self.conn.shutdowncode}")
 
     def set_texts(self, texts, html_escape=True):
         n = 0
@@ -1202,8 +1599,8 @@ class Wayland_view:
                         class_="iss-view")
 
         if refresh and refresh_interval_s:
-            view.eventlist.append(Content_refresh(self, w, refresh,
-                                                  refresh_interval_s, html_escape))
+            self.conn.eventlist.append(Content_refresh(self, w, refresh,
+                                                       refresh_interval_s, html_escape))
             logging.info(f"view: Refreshing content every {refresh_interval_s}s")
 
         self.create_window(w)
@@ -1229,6 +1626,9 @@ class Display:
     window_app_ids = ("iss-view", "firefox")
     # Every window we cycle gets a workspace to itself, named with this prefix
     workspace_prefix = "iss-"
+    # Where the state server binds and where its clients look for it
+    default_state_udp_host = "127.0.0.1"
+    default_state_udp_port = 7042
 
     def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
@@ -1237,15 +1637,24 @@ class Display:
         self.res_y = res_y
         self.started = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
         self.start_time = time.time()
-        self.switching_windows = list()
         self.window_blacklist = list()
+        self.rotation_index = 0
+        self.rotation_step = 0
+        self.skip_event = threading.Event()
         self.play_items = dict()
+        self.playlist = None
         self.screenshot_path = "/tmp"
         self.screenshot_file = "screenshot.png"
         self.socket_path = self.get_socket_path()
+
+        resolution = self.output_resolution()
+        if resolution:
+            self.res_x, self.res_y = resolution
         # UDP state server defaults
-        self.state_udp_host = os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
-        self.state_udp_port = int(os.environ.get('DISPLAY_STATE_UDP_PORT', '7042'))
+        self.state_udp_host = os.environ.get('DISPLAY_STATE_UDP_HOST',
+                                             self.default_state_udp_host)
+        self.state_udp_port = int(os.environ.get('DISPLAY_STATE_UDP_PORT',
+                                                 self.default_state_udp_port))
         self._state_server_thread = None
         self._state_server_stop = threading.Event()
         self._state_server_sock = None
@@ -1367,16 +1776,51 @@ class Display:
                     continue
                 msg = data.decode('utf-8', errors='ignore').strip()
                 if msg == 'GET_STATE':
+                    metrics.inc("iss_display_state_commands_total", command="GET_STATE")
                     payload = {
                         'address': self.address,
                         'port': self.port,
                         'res_x': self.res_x,
                         'res_y': self.res_y,
+                        'playlist_name': self.playlist.name if self.playlist else "",
+                        'default_play_time_s': (self.playlist.default_play_time_s
+                                                if self.playlist else 0),
                     }
-                    try:
-                        self._state_server_sock.sendto(json.dumps(payload).encode('utf-8'), addr)
-                    except Exception as e:
-                        logging.error(f"Display UDP server send error: {e}")
+                    self.send_json(addr, payload)
+                elif msg == 'GET_METRICS':
+                    metrics.inc("iss_display_state_commands_total", command="GET_METRICS")
+                    self.send_json(addr, self.metrics_snapshot())
+                elif msg == 'GET_PLAYLIST':
+                    metrics.inc("iss_display_state_commands_total", command="GET_PLAYLIST")
+                    payload = {'playlist': self.playlist_items()}
+                    self.send_json(addr, payload)
+                elif msg == 'NEXT':
+                    metrics.inc("iss_display_state_commands_total", command="NEXT")
+                    self.send_json(addr, self.step_rotation(1))
+                elif msg == 'PREVIOUS':
+                    metrics.inc("iss_display_state_commands_total", command="PREVIOUS")
+                    self.send_json(addr, self.step_rotation(-1))
+                elif msg.startswith('DEFAULT_TIME '):
+                    metrics.inc("iss_display_state_commands_total", command="DEFAULT_TIME")
+                    self.send_json(addr,
+                                   self.set_default_play_time(msg.split(None, 1)[1].strip()))
+                elif msg.startswith('NAME'):
+                    metrics.inc("iss_display_state_commands_total", command="NAME")
+                    parts = msg.split(None, 1)
+                    payload = self.set_playlist_name(parts[1] if len(parts) > 1 else "")
+                    self.send_json(addr, payload)
+                elif msg.startswith('ADD '):
+                    metrics.inc("iss_display_state_commands_total", command="ADD")
+                    payload = self.add_playlist_item(msg.split(None, 1)[1].strip())
+                    self.send_json(addr, payload)
+                elif msg.startswith('RESOLUTION '):
+                    metrics.inc("iss_display_state_commands_total", command="RESOLUTION")
+                    payload = self.set_resolution(msg.split(None, 1)[1].strip())
+                    self.send_json(addr, payload)
+                elif msg.startswith('TOGGLE '):
+                    metrics.inc("iss_display_state_commands_total", command="TOGGLE")
+                    payload = self.toggle_playlist_item(msg.split(None, 1)[1].strip())
+                    self.send_json(addr, payload)
                 elif msg == 'STOP':
                     break
                 else:
@@ -1394,9 +1838,11 @@ class Display:
             logging.info("Display UDP server socket closed")
 
     @staticmethod
-    def query_state(host=None, port=None, timeout=0.5):
-        host = host or os.environ.get('DISPLAY_STATE_UDP_HOST', '127.0.0.1')
-        port = int(port or os.environ.get('DISPLAY_STATE_UDP_PORT', '6100'))
+    def send_command(message, host=None, port=None, timeout=0.5):
+        host = host or os.environ.get('DISPLAY_STATE_UDP_HOST',
+                                      Display.default_state_udp_host)
+        port = int(port or os.environ.get('DISPLAY_STATE_UDP_PORT',
+                                          Display.default_state_udp_port))
         try:
             try:
                 ip_obj = ipaddress.ip_address(host)
@@ -1406,15 +1852,139 @@ class Display:
 
             with socket.socket(family, socket.SOCK_DGRAM) as s:
                 s.settimeout(timeout)
-                s.sendto(b'GET_STATE', (host, port))
-                data, _ = s.recvfrom(4096)
+                s.sendto(message.encode('utf-8'), (host, port))
+                data, _ = s.recvfrom(65535)
                 return json.loads(data.decode('utf-8'))
         except socket.timeout:
-            logging.warning("Display UDP client: timeout querying state")
+            logging.warning(f"Display UDP client: timeout on {message}")
             return None
         except Exception as e:
             logging.error(f"Display UDP client error: {e}")
             return None
+
+    @staticmethod
+    def query_state(host=None, port=None, timeout=0.5):
+        return Display.send_command('GET_STATE', host, port, timeout)
+
+    @staticmethod
+    def query_playlist(host=None, port=None, timeout=0.5):
+        reply = Display.send_command('GET_PLAYLIST', host, port, timeout)
+
+        return (reply or {}).get('playlist')
+
+    @staticmethod
+    def toggle_item(num, host=None, port=None, timeout=1.0):
+        return Display.send_command(f'TOGGLE {num}', host, port, timeout)
+
+    @staticmethod
+    def query_metrics(host=None, port=None, timeout=1.0):
+        return Display.send_command('GET_METRICS', host, port, timeout)
+
+    @staticmethod
+    def step(direction, host=None, port=None, timeout=2.0):
+        return Display.send_command('NEXT' if direction > 0 else 'PREVIOUS',
+                                    host, port, timeout)
+
+    @staticmethod
+    def set_default_time(play_time_s, host=None, port=None, timeout=2.0):
+        return Display.send_command(f'DEFAULT_TIME {play_time_s}', host, port, timeout)
+
+    @staticmethod
+    def set_name(name, host=None, port=None, timeout=2.0):
+        return Display.send_command(f'NAME {name}'.strip(), host, port, timeout)
+
+    @staticmethod
+    def add_item(uri, host=None, port=None, timeout=15.0):
+        return Display.send_command(f'ADD {uri}', host, port, timeout)
+
+    @staticmethod
+    def set_output_resolution(mode, host=None, port=None, timeout=15.0):
+        return Display.send_command(f'RESOLUTION {mode}', host, port, timeout)
+
+    def restart_views(self, timeout_s=5):
+        with live_views_lock:
+            stopping = [conn for conn, _ in live_views]
+        for conn in stopping:
+            try:
+                conn.stop(0)
+            except Exception as e:
+                logging.warning(f"display: Failed to stop a view: {e}")
+        logging.info(f"display: Stopping {len(stopping)} view(s)")
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            with live_views_lock:
+                if not live_views:
+                    break
+            time.sleep(0.1)
+
+        with live_views_lock:
+            left = len(live_views)
+        if left:
+            logging.warning(f"display: {left} view(s) did not stop in time")
+
+        if not self.playlist:
+            return 0
+
+        started = 0
+        for item in self.playlist.playlist:
+            if not item.get("enabled", True):
+                continue
+            item["started"] = False
+            if self.playlist.start_item(item):
+                started += 1
+
+        logging.info(f"display: Restarted {started} view(s)")
+
+        return started
+
+    def set_resolution(self, mode):
+        match = re.fullmatch(r"(\d{3,5})x(\d{3,5})", str(mode or "").strip())
+        if not match:
+            return {"error": f"bad resolution {mode!r}"}
+
+        try:
+            cmd = ['swaymsg', '-s', self.socket_path, '-t', 'get_outputs']
+            outputs = json.loads(self.swaymsg_send_message(
+                cmd, env=env, log_prefix="set_resolution"))
+        except Exception as e:
+            return {"error": f"could not read outputs: {e}"}
+
+        if not outputs:
+            return {"error": "no outputs"}
+
+        name = outputs[0].get('name')
+        was = (self.res_x, self.res_y)
+        cmd = ['swaymsg', '-s', self.socket_path,
+               'output', name, 'resolution', f"{match.group(1)}x{match.group(2)}"]
+        self.swaymsg_send_message(cmd, env=env, log_prefix="set_resolution")
+
+        resolution = self.output_resolution()
+        if resolution:
+            self.res_x, self.res_y = resolution
+        logging.info(f"display: Resolution of {name} now {self.res_x}x{self.res_y}")
+
+        # Views size themselves once and cannot be resized, so they are torn
+        # down and spawned again to pick the new resolution up
+        restarted = None
+        if (self.res_x, self.res_y) != was:
+            restarted = self.restart_views()
+
+        return {"output": name, "res_x": self.res_x, "res_y": self.res_y,
+                "restarted": restarted}
+
+    def output_resolution(self):
+        try:
+            cmd = ['swaymsg', '-s', self.socket_path, '-t', 'get_outputs']
+            out = self.swaymsg_send_message(cmd, env=env, log_prefix="output_resolution")
+            for output in json.loads(out):
+                mode = output.get('current_mode') or {}
+                if mode.get('width') and mode.get('height'):
+                    return mode['width'], mode['height']
+        except Exception as e:
+            logging.warning(f"display: Failed to read output resolution: {e}")
+
+        return None
 
     def get_socket_path(self):
         cmd = ['sway', '--get-socketpath']
@@ -1454,6 +2024,7 @@ class Display:
             logging.debug(f"{prefix}: stdout: {out}")
         if err:
             logging.warning(f"{prefix}: stderr: {err}")
+            metrics.inc("iss_display_swaymsg_errors_total")
 
         return out
 
@@ -1463,7 +2034,8 @@ class Display:
         # the compositor is still mapping, so match on what we spawn instead.
         # Keeps the background and any foreign window out of the rotation
         windows = [w for w in windows
-                   if w.get("app_id") in self.window_app_ids]
+                   if w.get("app_id") in self.window_app_ids
+                   and (self.window_item(w) or {}).get("enabled", True)]
         logging.debug(f"display: {len(windows)} windows in whitelist")
 
         return windows
@@ -1560,7 +2132,8 @@ class Display:
     # which is how a window found in the tree is matched back to its item.
     # The browser titles its own window, so it is matched on app_id instead
     def set_playlist(self, playlist):
-        for item in playlist:
+        self.playlist = playlist
+        for item in playlist.playlist:
             if item["player"] == "browser":
                 key = "firefox"
             else:
@@ -1568,6 +2141,178 @@ class Display:
             self.play_items[key] = item
 
         logging.info(f"display: Tracking {len(self.play_items)} playlist items")
+
+    max_datagram = 60000
+
+    @staticmethod
+    def trim_payload(payload):
+        if not isinstance(payload, dict):
+            return payload
+
+        trimmed = dict(payload)
+        for kind in ("counters", "gauges"):
+            series = trimmed.get(kind)
+            if series is None:
+                continue
+            trimmed[kind] = [entry for entry in series
+                             if not any(label[0] == "num" for label in entry[1])]
+        if isinstance(trimmed.get("playlist"), list):
+            trimmed["playlist"] = trimmed["playlist"][:50]
+        trimmed["partial"] = True
+
+        return trimmed
+
+    def send_json(self, addr, payload):
+        data = json.dumps(payload).encode('utf-8')
+        if len(data) > self.max_datagram:
+            logging.warning(f"display: State payload is {len(data)} bytes, trimming")
+            data = json.dumps(self.trim_payload(payload)).encode('utf-8')
+        if len(data) > self.max_datagram:
+            logging.error(f"display: State payload still {len(data)} bytes, dropping")
+            data = json.dumps({"error": "payload too large",
+                               "bytes": len(data)}).encode('utf-8')
+
+        try:
+            self._state_server_sock.sendto(data, addr)
+        except Exception as e:
+            logging.error(f"Display UDP server send error: {e}")
+
+    def metrics_snapshot(self):
+        metrics.set("iss_display_start_time_seconds", self.start_time)
+        metrics.set("iss_display_build_info", 1,
+                    python=platform.python_version(),
+                    deps_ref=self.deps_ref())
+
+        try:
+            all_windows = self.get_windows()
+            rotating = self.get_windows_whitelist()
+        except Exception:
+            all_windows, rotating = [], []
+
+        metrics.set("iss_display_windows", len(all_windows), state="total")
+        metrics.set("iss_display_windows", len(rotating), state="rotating")
+        metrics.set("iss_display_browser_up",
+                    1 if any(w.get("app_id") == "firefox" for w in all_windows) else 0)
+
+        metrics.clear_gauge("iss_display_surface_commits_total")
+        metrics.clear_gauge("iss_display_frames_presented_total")
+        with live_views_lock:
+            windows = [w for _, w in live_views]
+        for window in windows:
+            title = getattr(window, "title", "") or "unknown"
+            metrics.set("iss_display_surface_commits_total",
+                        getattr(window, "commits", 0), view=title)
+            metrics.set("iss_display_frames_presented_total",
+                        getattr(window, "frames", 0), view=title)
+
+        metrics.clear_gauge("iss_display_content_age_seconds")
+        now = time.time()
+        with last_content_refresh_lock:
+            ages = {k: now - v for k, v in last_content_refresh.items()}
+        for source, age in ages.items():
+            metrics.set("iss_display_content_age_seconds", age, player=source)
+
+        metrics.clear_gauge("iss_display_item_enabled")
+        metrics.clear_gauge("iss_display_item_play_time_seconds")
+        for item in (self.playlist.playlist if self.playlist else []):
+            labels = {"player": item["player"], "num": item["num"]}
+            metrics.set("iss_display_item_enabled",
+                        1 if item.get("enabled", True) else 0, **labels)
+            metrics.set("iss_display_item_play_time_seconds",
+                        item.get("play_time_s", 0), **labels)
+
+        return metrics.snapshot()
+
+    @staticmethod
+    def deps_ref():
+        try:
+            with open("/venv/deps-ref") as f:
+                return f.read().strip() or "unpinned"
+        except OSError:
+            return "unknown"
+
+    def playlist_items(self):
+        if not self.playlist:
+            return []
+
+        return [{k: v for k, v in item.items() if k != "news"}
+                for item in self.playlist.playlist]
+
+    def set_default_play_time(self, play_time_s):
+        if not self.playlist:
+            return {"error": "no playlist"}
+
+        try:
+            play_time_s = int(play_time_s)
+        except (TypeError, ValueError):
+            return {"error": f"bad play time {play_time_s!r}"}
+
+        if play_time_s < 1 or play_time_s > 86400:
+            return {"error": f"play time {play_time_s} out of range"}
+
+        self.playlist.set_default_play_time(play_time_s)
+        logging.info(f"display: Default play time is now {play_time_s}s")
+
+        return {"default_play_time_s": play_time_s}
+
+    def set_playlist_name(self, name):
+        if not self.playlist:
+            return {"error": "no playlist"}
+
+        self.playlist.name = str(name or "").strip()
+        logging.info(f"display: Playlist name is now {self.playlist.name!r}")
+
+        return {"playlist_name": self.playlist.name}
+
+    def add_playlist_item(self, uri):
+        if not self.playlist:
+            return {"error": "no playlist"}
+
+        uri = str(uri or "").strip()
+        if not uri:
+            return {"error": "no uri given"}
+
+        try:
+            item = self.playlist.add(uri)
+        except Exception as e:
+            return {"error": f"could not add {uri}: {e}"}
+
+        if not item:
+            return {"error": f"no player for {uri}"}
+
+        if item["player"] == "browser":
+            self.play_items["firefox"] = item
+        else:
+            self.play_items[f"{item['player']}-{item['num']}"] = item
+
+        logging.info(f"display: Added item {item['num']}: {item['uri']}")
+        if item.get("enabled", True):
+            self.playlist.start_item(item)
+
+        return {k: v for k, v in item.items() if k != "news"}
+
+    def toggle_playlist_item(self, num):
+        try:
+            num = int(num)
+        except (TypeError, ValueError):
+            return {"error": f"bad item number {num!r}"}
+
+        if not self.playlist:
+            return {"error": "no playlist"}
+
+        for item in self.playlist.playlist:
+            if item.get("num") != num:
+                continue
+
+            item["enabled"] = not item.get("enabled", True)
+            logging.info(f"display: Item {num} ({item['uri']}) "
+                         f"now {'enabled' if item['enabled'] else 'disabled'}")
+            if item["enabled"] and not item.get("started"):
+                self.playlist.start_item(item)
+
+            return {"num": num, "enabled": item["enabled"]}
+
+        return {"error": f"no item {num}"}
 
     def window_item(self, window):
         for key in (window.get("name"), window.get("app_id")):
@@ -1593,18 +2338,27 @@ class Display:
                                   args=(t_focus_s,))
         self.x.start()
 
+    def step_rotation(self, step):
+        self.rotation_step = step
+        self.skip_event.set()
+
+        return {"step": step}
+
+    # Rebuilt every cycle rather than kept as a queue, so an item disabled or
+    # added since the last switch is picked up at once, and next and previous
+    # are a move of the index rather than surgery on a half consumed list
     def focus_next_window(self, t_focus_s):
         while True:
-            if len(self.switching_windows) == 0:
-                self.switching_windows = self.get_windows_whitelist()
-                self.switching_windows.sort(key=self.window_order, reverse=True)
-                if len(self.switching_windows) == 0:
-                    logging.debug("display: Found no windows to switch to")
-                    time.sleep(t_focus_s)
+            windows = self.get_windows_whitelist()
+            windows.sort(key=self.window_order)
+            if not windows:
+                logging.debug("display: Found no windows to switch to")
+                time.sleep(t_focus_s)
 
-                    continue
+                continue
 
-            next_window = self.switching_windows.pop()
+            self.rotation_index %= len(windows)
+            next_window = windows[self.rotation_index]
             win_id = next_window['id']
             play_time_s = self.window_play_time(next_window, t_focus_s)
             logging.info(f"display: Switching focus to: {win_id} "
@@ -1623,34 +2377,19 @@ class Display:
             cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={win_id}]", 'focus']
             self.swaymsg_send_message(cmd, env=env, log_prefix="focus_next_window")
 
-            time.sleep(play_time_s)
+            item = self.window_item(next_window) or {}
+            labels = {"player": item.get("player", "unknown"),
+                      "num": item.get("num", 0)}
+            metrics.inc("iss_display_window_switches_total", **labels)
+            shown_from = time.time()
+            self.skip_event.wait(play_time_s)
+            self.skip_event.clear()
+            metrics.inc("iss_display_item_shown_seconds_total",
+                        time.time() - shown_from, **labels)
 
-    async def fullscreen_next_window(self):
-        await asyncio.sleep(random.random() * 3)
-        t = round(time.time() - self.start_time, 1)
-        logging.info(f"Finished task: {t}")
-
-        if len(self.switching_windows) == 0:
-            self.switching_windows = self.get_windows_whitelist()
-            if len(self.switching_windows) == 0:
-                logging.debug("display: Expected windows to display but there is none")
-
-                return
-
-        next_window = self.switching_windows.pop()
-        logging.info(f"display: Switching focus to: {next_window['id']}")
-
-        cmd = ['swaymsg', '-s', self.socket_path, f"[con_id={next_window['id']}]", 'fullscreen']
-
-        self.swaymsg_send_message(cmd, env=env, log_prefix="fullscreen_next_window")
-
-    async def task_scheduler(self, interval_s, interval_function):
-        while True:
-            logging.info(f"Starting periodic function: {round(time.time() - self.start_time, 1)}")
-            await asyncio.gather(
-                asyncio.sleep(interval_s),
-                interval_function(),
-            )
+            step = self.rotation_step or 1
+            self.rotation_step = 0
+            self.rotation_index = (self.rotation_index + step) % len(windows)
 
     def switch_workspace(self, ws):
         cmd = ['swaymsg', '-s', self.socket_path, 'workspace', str(ws)]
@@ -1689,33 +2428,104 @@ class Iss:
 
 
 class HtmlPage:
+
+    resolutions = ("1024x768", "1280x800", "1366x768", "1600x900", "1920x1080")
+
     @staticmethod
     def get_css():
         return """
         <style>
+        :root { --ambilight: #111; }
+        body {
+            background: var(--ambilight);
+            transition: background 1.2s linear;
+            margin: 0;
+            padding: 1.5em;
+        }
         #screenshot { max-width: 100%; display: block; }
-        .img-container {
+        .player {
             position: relative;
             display: inline-block;
+            line-height: 0;
         }
-        #pause-btn {
+        .player:fullscreen {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--ambilight);
+            transition: background 1.2s linear;
+        }
+        .player:fullscreen #screenshot {
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        .overlay {
             position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            z-index: 10;
+            inset: 0;
+            display: none;
+            overflow: auto;
+            padding: 1em;
+            box-sizing: border-box;
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            line-height: normal;
+        }
+        .overlay th, .overlay td { color: #fff; }
+        .controls {
+            position: absolute;
+            bottom: 0.75em;
+            right: 0.75em;
+            display: none;
+            gap: 0.5em;
+            z-index: 20;
+        }
+        .controls #pause-btn { margin-right: 1.5em; }
+        .player:hover .overlay { display: flex; }
+        .player:hover .controls { display: flex; }
+        .overlay .tables-row {
+            margin: auto;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        .menu {
+            position: absolute;
+            bottom: 3.6em;
+            right: 0.75em;
+            display: none;
+            flex-direction: column;
+            gap: 0.3em;
+            z-index: 25;
+        }
+        .player:hover .menu.open { display: flex; }
+        .menu button {
             background: rgba(0,0,0,0.7);
             color: #fff;
             border: 2px solid #fff;
             border-radius: 8px;
-            padding: 20px 40px;
-            font-size: 2.5em;
+            padding: 0.25em 0.6em;
             font-weight: bold;
             cursor: pointer;
             opacity: 0.85;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+        }
+        .controls button {
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            border: 2px solid #fff;
+            border-radius: 8px;
+            padding: 0.2em 0.5em;
+            font-size: 1.8em;
+            font-weight: bold;
+            line-height: 1;
+            cursor: pointer;
+            opacity: 0.85;
+        }
+        .overlay button {
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            border: 1px solid #fff;
+            border-radius: 6px;
+            padding: 0.1em 0.5em;
+            cursor: pointer;
         }
         table td {
             padding: 0.5em 2em 0.5em 0.5em;
@@ -1744,14 +2554,19 @@ class HtmlPage:
         res_y = state.get('res_y')
 
         rows = [
+            ("Playlist", state.get('playlist_name') or "", "playlist-name"),
+            ("Default time", state.get('default_play_time_s') or "", "default-time"),
             ("Name", name),
             ("Address", address),
             ("Port", port),
             ("Resolution", f"{res_x} x {res_y}")
         ]
         table = ["<table>"]
-        for key, value in rows:
-            table.append(f"<tr><td>{html.escape(str(key))}</td><td>{html.escape(str(value))}</td></tr>")
+        for row in rows:
+            key, value = row[0], row[1]
+            css = f' class="{row[2]}"' if len(row) > 2 else ""
+            table.append(f"<tr><td>{html.escape(str(key))}</td>"
+                         f"<td{css}>{html.escape(str(value))}</td></tr>")
         table.append("</table>")
         return "".join(table)
 
@@ -1764,7 +2579,7 @@ class HtmlPage:
 
         table = [
             "<table>",
-            "<thead><tr><th>#</th><th>URI</th><th>Player</th><th>Time (s)</th></tr></thead>",
+            "<thead><tr><th>#</th><th>URI</th><th>Player</th><th>Time (s)</th><th>State</th><th></th></tr></thead>",
             "<tbody>",
         ]
         for item in playlist_items:
@@ -1772,10 +2587,16 @@ class HtmlPage:
             uri = str(item.get('uri', ''))
             player = str(item.get('player', ''))
             play_time_s = str(item.get('play_time_s', ''))
+            enabled = "enabled" if item.get('enabled', True) else "disabled"
+            toggle = (f"<button onclick=\"toggleItem({html.escape(num)}, this)\">"
+                      f"{'disable' if item.get('enabled', True) else 'enable'}</button>")
             table.append(
-                f"<tr><td>{html.escape(num)}</td><td>{html.escape(uri)}</td><td>{html.escape(player)}</td><td>{html.escape(play_time_s)}</td></tr>"
+                f"<tr><td>{html.escape(num)}</td><td>{html.escape(uri)}</td><td>{html.escape(player)}</td><td>{html.escape(play_time_s)}</td><td class=\"state\">{html.escape(enabled)}</td><td>{toggle}</td></tr>"
             )
         table.append("</tbody>")
+        table.append('<tfoot><tr><td colspan="5"></td>'
+                     '<td><button onclick="addItem()" title="Add an item">+</button></td>'
+                     '</tr></tfoot>')
         table.append("</table>")
         return "".join(table)
 
@@ -1783,24 +2604,159 @@ class HtmlPage:
     def page_display():
         # screenshot image that refreshes via fetch, with pause button
         body = (
-            '<div class="img-container">'
-            '  <button id="pause-btn" style="display:none;">⏸</button>'
+            '<div class="player" id="player">'
             '  <img id="screenshot" src="/api/v1/screenshot" alt="Screenshot" />'
+            '  <div class="overlay"><div class="tables-row">'
+            + HtmlPage.show_display_data()
+            + HtmlPage.show_playlist_data()
+            + '</div></div>'
+            '  <div class="controls">'
+            '    <button id="prev-btn" title="Previous">⏮</button>'
+            '    <button id="pause-btn" title="Pause">⏸</button>'
+            '    <button id="next-btn" title="Next">⏭</button>'
+            '    <button id="shot-btn" title="Save screenshot">⤓</button>'
+            '    <button id="fs-btn" title="Fullscreen">⛶</button>'
+            '    <button id="res-btn" title="Resolution">⇲</button>'
+            '    <button id="settings-btn" title="Settings">⚙</button>'
+            '  </div>'
+            '  <div class="menu" id="res-menu">'
+            + "".join(f'<button onclick="setResolution(\'{mode}\')">{mode}</button>'
+                      for mode in HtmlPage.resolutions) +
+            '  </div>'
             '</div>'
             '<script>'
             'let paused = false;'
+            'const player = document.getElementById("player");'
             'const btn = document.getElementById("pause-btn");'
+            'const fsBtn = document.getElementById("fs-btn");'
+            'const shotBtn = document.getElementById("shot-btn");'
+            'const resBtn = document.getElementById("res-btn");'
+            'const resMenu = document.getElementById("res-menu");'
+            'resBtn.onclick = function(e) {'
+            '  e.stopPropagation();'
+            '  resMenu.classList.toggle("open");'
+            '};'
+            'async function setResolution(mode){'
+            '  resMenu.classList.remove("open");'
+            '  try {'
+            '    await fetch("/api/v1/resolution/" + mode, {method: "POST"});'
+            '  } catch(e) { }'
+            '}'
             'const img = document.getElementById("screenshot");'
-            'img.addEventListener("mouseenter", function() { btn.style.display = "block"; });'
-            'img.addEventListener("mouseleave", function() { btn.style.display = "none"; });'
-            'btn.addEventListener("mouseleave", function() { btn.style.display = "none"; });'
-            'btn.onclick = function() { paused = !paused; btn.innerText = paused ? "\u25B6" : "\u23F8"; };'
+            'const sampler = document.createElement("canvas");'
+            'const sctx = sampler.getContext("2d", {willReadFrequently: true});'
+            'function ambilight(){'
+            '  if(!img.naturalWidth || !img.naturalHeight) return;'
+            '  const sw = 64, sh = 36, band = 2;'
+            '  sampler.width = sw; sampler.height = sh;'
+            '  sctx.drawImage(img, 0, 0, sw, sh);'
+            '  let data;'
+            '  try { data = sctx.getImageData(0, 0, sw, sh).data; } catch(e) { return; }'
+            '  let r = 0, g = 0, b = 0, n = 0;'
+            '  for(let y = 0; y < sh; y++){'
+            '    for(let x = 0; x < sw; x++){'
+            '      if(x >= band && x < sw - band && y >= band && y < sh - band) continue;'
+            '      const i = (y * sw + x) * 4;'
+            '      r += data[i]; g += data[i+1]; b += data[i+2]; n++;'
+            '    }'
+            '  }'
+            '  if(!n) return;'
+            '  const rgb = "rgb(" + Math.round(r/n) + "," + Math.round(g/n) + "," + Math.round(b/n) + ")";'
+            '  document.documentElement.style.setProperty("--ambilight", rgb);'
+            '}'
+            'img.addEventListener("load", ambilight);'
+            'if(img.complete) ambilight();'
+            'btn.onclick = function(e) {'
+            '  e.stopPropagation();'
+            '  paused = !paused;'
+            '  btn.innerText = paused ? "\u25B6" : "\u23F8";'
+            '  btn.title = paused ? "Play" : "Pause";'
+            '};'
+            'shotBtn.onclick = async function(e) {'
+            '  e.stopPropagation();'
+            '  try {'
+            '    const res = await fetch("/api/v1/screenshot", {cache: "no-store"});'
+            '    if(!res.ok) return;'
+            '    const blob = await res.blob();'
+            '    if(!blob.size) return;'
+            '    const a = document.createElement("a");'
+            '    a.href = URL.createObjectURL(blob);'
+            '    a.download = "iss-display.png";'
+            '    a.click();'
+            '    URL.revokeObjectURL(a.href);'
+            '  } catch(e) { }'
+            '};'
+            'fsBtn.onclick = function(e) {'
+            '  e.stopPropagation();'
+            '  if (document.fullscreenElement) { document.exitFullscreen(); }'
+            '  else { player.requestFullscreen(); }'
+            '};'
+            'document.addEventListener("fullscreenchange", function() {'
+            '  fsBtn.title = document.fullscreenElement ? "Exit fullscreen" : "Fullscreen";'
+            '});'
+            'document.getElementById("prev-btn").onclick = function(e) {'
+            '  e.stopPropagation();'
+            '  fetch("/api/v1/previous", {method: "POST"});'
+            '};'
+            'document.getElementById("next-btn").onclick = function(e) {'
+            '  e.stopPropagation();'
+            '  fetch("/api/v1/next", {method: "POST"});'
+            '};'
+            'const settingsBtn = document.getElementById("settings-btn");'
+            'settingsBtn.onclick = async function(e) {'
+            '  e.stopPropagation();'
+            '  const current = document.querySelector(".overlay td.playlist-name");'
+            '  const name = prompt("Playlist name", current ? current.textContent : "");'
+            '  if(name === null) return;'
+            '  const shown = document.querySelector(".overlay td.default-time");'
+            '  const t = prompt("Default display time in seconds",'
+            '                   shown ? shown.textContent : "");'
+            '  let url = "/api/v1/settings?name=" + encodeURIComponent(name);'
+            '  if(t) url += "&default_time=" + encodeURIComponent(t);'
+            '  try {'
+            '    await fetch(url, {method: "POST"});'
+            '    await refreshOverlay();'
+            '  } catch(e) { }'
+            '};'
+            'async function refreshOverlay(){'
+            '  try {'
+            '    const res = await fetch(location.href, {cache: "no-store"});'
+            '    const doc = new DOMParser().parseFromString(await res.text(), "text/html");'
+            '    document.querySelector(".overlay").innerHTML ='
+            '      doc.querySelector(".overlay").innerHTML;'
+            '  } catch(e) { }'
+            '}'
+            'async function addItem(){'
+            '  const uri = prompt("URI to add", "iss://apod");'
+            '  if(!uri) return;'
+            '  const t = prompt("Display time in seconds (blank for the default)", "");'
+            '  let url = "/api/v1/playlist?uri=" + encodeURIComponent(uri);'
+            '  if(t) url += "&t=" + encodeURIComponent(t);'
+            '  try {'
+            '    const res = await fetch(url, {method: "POST"});'
+            '    const data = await res.json();'
+            '    if(data.error) { alert(data.error); return; }'
+            '    await refreshOverlay();'
+            '  } catch(e) { }'
+            '}'
+            'async function toggleItem(num, el){'
+            '  try {'
+            '    const res = await fetch("/api/v1/playlist/" + num + "/toggle", {method: "POST"});'
+            '    if(!res.ok) return;'
+            '    const data = await res.json();'
+            '    if(data.enabled === undefined) return;'
+            '    const row = el.closest("tr");'
+            '    row.querySelector(".state").textContent = data.enabled ? "enabled" : "disabled";'
+            '    el.textContent = data.enabled ? "disable" : "enable";'
+            '  } catch(e) { }'
+            '}'
             'async function refreshScreenshot(){'
             '  if(paused) return;'
             '  try {'
             '    const res = await fetch("/api/v1/screenshot", {cache: "no-store"});'
             '    if(!res.ok) return;'
             '    const blob = await res.blob();'
+            '    if(!blob.size) return;'
             '    const url = URL.createObjectURL(blob);'
             '    const old = img.src;'
             '    img.src = url;'
@@ -1810,7 +2766,6 @@ class HtmlPage:
             'setInterval(refreshScreenshot, 1000);'
             '</script>'
         )
-        body += '<div class="tables-row">' + HtmlPage.show_display_data() + HtmlPage.show_playlist_data() + '</div>'
         return "<html><head><title>ISS Display</title>" + HtmlPage.get_css() + "</head><body>" + body + "</body></html>"
 
 
@@ -2083,7 +3038,7 @@ if __name__ == "__main__":
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
     for item in playlist.playlist:
         logging.info(f"Playlist item {item['num']}: {item['uri']} -> {item['player']}")
-    display.set_playlist(playlist.playlist)
+    display.set_playlist(playlist)
     display.start_window_switching(5)
     threads = playlist.start_player(probe_ip_address)
     started = len(threads)
@@ -2154,6 +3109,8 @@ if __name__ == "__main__":
     # Start ASGI server via uvicorn
     try:
         cmd = ['uvicorn', 'controller:asgi_app', '--host', listen_address, '--port', str(listen_port)]
+        if str(loglevel).upper() != 'DEBUG':
+            cmd.append('--no-access-log')
         logging.info(f"Starting uvicorn ASGI server on {listen_address}:{listen_port}")
         # Ensure the controller directory is importable so uvicorn can import 'controller:asgi_app'
         module_dir = os.path.dirname(os.path.abspath(__file__))
