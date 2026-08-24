@@ -190,7 +190,12 @@ def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
              title=None, refresh=None, refresh_interval_s=None,
              args=None, **_):
     def render(content):
-        cmd = [cmds["vju"], "--fullscreen"]
+        # Sized as well as fullscreened: every window we spawn is floated, and
+        # a floating window gets the size it asks for, so fullscreen alone
+        # leaves vju at its own default size
+        cmd = [cmds["vju"], "--fullscreen",
+               "--width", str(display.res_x),
+               "--height", str(display.res_y)]
         if alignment == "center":
             cmd.append("--center-text")
         if font_sizes:
