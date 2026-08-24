@@ -45,7 +45,10 @@ stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"clock":        "humanbeans_clock",
         "image_viewer": "imv",
         "media_player": "mpv",
-        "screenshot":   "grim"}
+        "screenshot":   "grim",
+        "vju":          "vju"}
+
+draw_methods = ("python-wayland", "vju")
 
 
 metric_meta = {
@@ -151,6 +154,87 @@ def render_metrics(*sources):
                 lines.append(f"{name} {value}")
 
     return "\n".join(lines) + "\n"
+
+def draw(texts, method="python-wayland", img_bg=False, font_sizes=None,
+         alignment=None, title=None, refresh=None, refresh_interval_s=None,
+         html_escape=True, args=None):
+    if method not in draw_methods:
+        logging.warning(f"draw: Unknown method {method!r}, drawing with python-wayland")
+        method = "python-wayland"
+
+    drawer = draw_vju if method == "vju" else draw_python
+
+    return drawer(texts, img_bg=img_bg, font_sizes=font_sizes,
+                  alignment=alignment, title=title, refresh=refresh,
+                  refresh_interval_s=refresh_interval_s,
+                  html_escape=html_escape, args=args)
+
+def draw_python(texts, img_bg=False, font_sizes=None, alignment=None,
+                title=None, refresh=None, refresh_interval_s=None,
+                html_escape=True, args=None):
+    view = Wayland_view(display.res_x, display.res_y, max(len(texts), 1), theme)
+    for n in range(len(view.s_objects)):
+        if font_sizes:
+            view.s_objects[n]["font_size"] = font_sizes[min(n, len(font_sizes) - 1)]
+        if alignment:
+            view.s_objects[n]["alignment"] = alignment
+
+    return view.show_content(texts, img_bg,
+                             refresh=refresh,
+                             refresh_interval_s=refresh_interval_s,
+                             html_escape=html_escape)
+
+# vju reads what it shows from stdin and keeps its window for as long as it
+# runs, so a refresh is a fresh process rather than a repaint
+def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
+             title=None, refresh=None, refresh_interval_s=None,
+             args=None, **_):
+    def render(content):
+        cmd = [cmds["vju"], "--fullscreen"]
+        if alignment == "center":
+            cmd.append("--center-text")
+        if font_sizes:
+            cmd += ["--font-size", str(font_sizes[0])]
+        if title:
+            cmd += ["--title", str(title)]
+        if img_bg:
+            cmd += ["--background-image", str(img_bg)]
+        cmd += [str(a) for a in (args or [])]
+
+        # With --watch vju re-runs the trailing command itself and keeps its
+        # own window, so it is left to run rather than fed on stdin
+        watching = "--watch" in cmd
+        logging.info(f"vju: {' '.join(cmd)}")
+        proc = Popen(cmd, env=env, shell=False, close_fds=True,
+                     stdin=None if watching else subprocess.PIPE,
+                     encoding="utf8")
+        try:
+            if watching:
+                proc.wait()
+            else:
+                proc.communicate("\n".join(str(t) for t in content))
+        except Exception as e:
+            logging.error(f"vju: Failed to render: {e}")
+
+        return proc
+
+    if not refresh or not refresh_interval_s:
+        render(texts)
+
+        return True
+
+    content = texts
+    while True:
+        proc = render(content)
+        if proc.returncode not in (0, None):
+            logging.warning(f"vju: Exited with {proc.returncode}, stopping")
+            break
+        try:
+            content = refresh() or content
+        except Exception as e:
+            logging.warning(f"vju: Failed to refresh content: {e}")
+
+    return True
 
 def web_main(request):
     return HTMLResponse(HtmlPage.page_display())
@@ -677,7 +761,7 @@ class Playlist:
         self.playlist = self.create(uris)
         self.uris = self.get_uris()
 
-    our_params = ("t", "enabled", "refresh")
+    our_params = ("t", "enabled", "refresh", "method")
 
     @classmethod
     def split_params(cls, uri):
@@ -704,6 +788,18 @@ class Playlist:
             logging.warning(f"playlist: Ignoring play time {params['t']!r} in {uri}")
 
             return None
+
+    @staticmethod
+    def parse_method(params, uri):
+        method = params.get("method")
+        if method is None:
+            return None
+        if method in draw_methods:
+            return method
+
+        logging.warning(f"playlist: Ignoring method {method!r} in {uri}")
+
+        return None
 
     @staticmethod
     def parse_refresh(params, uri):
@@ -749,6 +845,7 @@ class Playlist:
             uri, params = self.split_params(uri)
             play_time_s = self.parse_play_time(params, uri)
             refresh_s = self.parse_refresh(params, uri)
+            method = self.parse_method(params, uri)
             enabled = self.parse_enabled(params, uri)
             if uri.endswith(".m3u8"):
                 item["num"] = n
@@ -821,6 +918,11 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "processes"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss://date"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "date"
+                item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss://top"):
                 item["num"] = n
                 item["uri"] = uri
@@ -861,6 +963,7 @@ class Playlist:
                 if play_time_s:
                     item["play_time_s"] = play_time_s
                 item["refresh_s"] = refresh_s
+                item["method"] = method or "python-wayland"
                 item["enabled"] = enabled
                 playlist.append(item)
 
@@ -954,11 +1057,17 @@ class Playlist:
         elif item["player"] == "sockets":
             x = threading.Thread(target=self.start_sockets_view,
                                  args=(self.theme.img_bg,
-                                       item.get("refresh_s") or 5))
+                                       item.get("refresh_s") or 5,
+                                       item.get("method", "python-wayland")))
+        elif item["player"] == "date":
+            x = threading.Thread(target=self.start_date_view,
+                                 args=(item.get("refresh_s") or 1,
+                                       f"{item['player']}-{item['num']}"))
         elif item["player"] == "top":
             x = threading.Thread(target=self.start_top_view,
                                  args=(self.theme.img_bg,
-                                       item.get("refresh_s") or 5))
+                                       item.get("refresh_s") or 5,
+                                       item.get("method", "python-wayland")))
         elif item["player"] == "system":
             x = threading.Thread(target=self.start_sys_view,
                                  args=(self.theme.img_bg,
@@ -1121,31 +1230,32 @@ class Playlist:
             view.s_objects[i]["alignment"] = "left"
         view.show_content(texts, img_bg)
 
-    def start_sockets_view(self, img_bg, refresh_interval_s=5):
+    def start_sockets_view(self, img_bg, refresh_interval_s=5,
+                           method="python-wayland"):
         logging.info("Starting sockets view")
 
         def sockets_texts():
             return [System.net_sockets(20) or "No sockets"]
 
-        view = Wayland_view(display.res_x, display.res_y, 1, theme)
-        view.s_objects[0]["font_size"] = 20
-        view.s_objects[0]["alignment"] = "left"
-        view.show_content(sockets_texts(), img_bg,
-                          refresh=sockets_texts,
-                          refresh_interval_s=refresh_interval_s)
+        draw(sockets_texts(), method=method, img_bg=img_bg,
+             font_sizes=[20], alignment="left", title="Sockets",
+             refresh=sockets_texts, refresh_interval_s=refresh_interval_s)
 
-    def start_top_view(self, img_bg, refresh_interval_s=5):
+    def start_date_view(self, refresh_interval_s=1, title=None):
+        logging.info("Starting date view")
+        draw([], method="vju", alignment="center", title=title,
+             args=["--watch", f"{refresh_interval_s}s", "date"])
+
+    def start_top_view(self, img_bg, refresh_interval_s=5,
+                       method="python-wayland"):
         logging.info("Starting top view")
 
         def top_texts():
             return [System.top(20) or "No process data"]
 
-        view = Wayland_view(display.res_x, display.res_y, 1, theme)
-        view.s_objects[0]["font_size"] = 20
-        view.s_objects[0]["alignment"] = "left"
-        view.show_content(top_texts(), img_bg,
-                          refresh=top_texts,
-                          refresh_interval_s=refresh_interval_s)
+        draw(top_texts(), method=method, img_bg=img_bg,
+             font_sizes=[20], alignment="left", title="Top",
+             refresh=top_texts, refresh_interval_s=refresh_interval_s)
 
     def start_playlist_view(self, img_bg):
         logging.info("Starting playlist view")
@@ -2094,7 +2204,8 @@ class Display:
         # the compositor is still mapping, so match on what we spawn instead.
         # Keeps the background and any foreign window out of the rotation
         windows = [w for w in windows
-                   if w.get("app_id") in self.window_app_ids
+                   if (w.get("app_id") in self.window_app_ids
+                       or self.window_item(w) is not None)
                    and (self.window_item(w) or {}).get("enabled", True)]
         logging.debug(f"display: {len(windows)} windows in whitelist")
 
