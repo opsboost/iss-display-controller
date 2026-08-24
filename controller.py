@@ -672,11 +672,12 @@ class Playlist:
         self.topics = topics or []
 
         self.probe_ip_address = None
+        self.browser = None
         self.playlist = list()
         self.playlist = self.create(uris)
         self.uris = self.get_uris()
 
-    our_params = ("t", "enabled")
+    our_params = ("t", "enabled", "refresh")
 
     @classmethod
     def split_params(cls, uri):
@@ -705,6 +706,25 @@ class Playlist:
             return None
 
     @staticmethod
+    def parse_refresh(params, uri):
+        if "refresh" not in params:
+            return None
+
+        try:
+            refresh_s = int(params["refresh"])
+        except ValueError:
+            logging.warning(f"playlist: Ignoring refresh {params['refresh']!r} in {uri}")
+
+            return None
+
+        if refresh_s < 1:
+            logging.warning(f"playlist: Ignoring refresh {refresh_s} in {uri}")
+
+            return None
+
+        return refresh_s
+
+    @staticmethod
     def parse_enabled(params, uri):
         if "enabled" not in params:
             return True
@@ -728,6 +748,7 @@ class Playlist:
             n += 1
             uri, params = self.split_params(uri)
             play_time_s = self.parse_play_time(params, uri)
+            refresh_s = self.parse_refresh(params, uri)
             enabled = self.parse_enabled(params, uri)
             if uri.endswith(".m3u8"):
                 item["num"] = n
@@ -839,6 +860,7 @@ class Playlist:
                 item["play_time_explicit"] = bool(play_time_s)
                 if play_time_s:
                     item["play_time_s"] = play_time_s
+                item["refresh_s"] = refresh_s
                 item["enabled"] = enabled
                 playlist.append(item)
 
@@ -931,10 +953,12 @@ class Playlist:
                                  args=(self.theme.img_bg,))
         elif item["player"] == "sockets":
             x = threading.Thread(target=self.start_sockets_view,
-                                 args=(self.theme.img_bg,))
+                                 args=(self.theme.img_bg,
+                                       item.get("refresh_s") or 5))
         elif item["player"] == "top":
             x = threading.Thread(target=self.start_top_view,
-                                 args=(self.theme.img_bg,))
+                                 args=(self.theme.img_bg,
+                                       item.get("refresh_s") or 5))
         elif item["player"] == "system":
             x = threading.Thread(target=self.start_sys_view,
                                  args=(self.theme.img_bg,
@@ -976,12 +1000,36 @@ class Playlist:
         env_mod['GECKODRIVER'] = env_mod.get('GECKODRIVER', '/usr/bin/geckodriver')
         env_mod['FIREFOX_BIN'] = env_mod.get('FIREFOX_BIN', '/usr/bin/firefox')
 
-        Popen(cmd,
-              env=env_mod,
-              shell=False,
-              start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
+        # Kept rather than discarded, and in our own session, so the browser
+        # can be waited on, restarted and stopped like any other player
+        self.stop_browser()
+        self.browser = Popen(cmd,
+                             env=env_mod,
+                             shell=False,
+                             close_fds=True,
+                             encoding='utf8')
+        logging.info(f"Started browser as pid {self.browser.pid}")
+
+        return True
+
+    def browser_running(self):
+        return self.browser is not None and self.browser.poll() is None
+
+    def stop_browser(self, timeout_s=5):
+        if not self.browser_running():
+            self.browser = None
+
+            return False
+
+        logging.info(f"Stopping browser pid {self.browser.pid}")
+        self.browser.terminate()
+        try:
+            self.browser.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            logging.warning("Browser did not stop, killing it")
+            self.browser.kill()
+            self.browser.wait(timeout=timeout_s)
+        self.browser = None
 
         return True
 
@@ -1073,21 +1121,31 @@ class Playlist:
             view.s_objects[i]["alignment"] = "left"
         view.show_content(texts, img_bg)
 
-    def start_sockets_view(self, img_bg):
+    def start_sockets_view(self, img_bg, refresh_interval_s=5):
         logging.info("Starting sockets view")
-        texts = [System.net_sockets(20) or "No sockets"]
-        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-        view.s_objects[0]["font_size"] = 20
-        view.s_objects[0]["alignment"] = "left"
-        view.show_content(texts, img_bg)
 
-    def start_top_view(self, img_bg):
-        logging.info("Starting top view")
-        texts = [System.top(20) or "No process data"]
-        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        def sockets_texts():
+            return [System.net_sockets(20) or "No sockets"]
+
+        view = Wayland_view(display.res_x, display.res_y, 1, theme)
         view.s_objects[0]["font_size"] = 20
         view.s_objects[0]["alignment"] = "left"
-        view.show_content(texts, img_bg)
+        view.show_content(sockets_texts(), img_bg,
+                          refresh=sockets_texts,
+                          refresh_interval_s=refresh_interval_s)
+
+    def start_top_view(self, img_bg, refresh_interval_s=5):
+        logging.info("Starting top view")
+
+        def top_texts():
+            return [System.top(20) or "No process data"]
+
+        view = Wayland_view(display.res_x, display.res_y, 1, theme)
+        view.s_objects[0]["font_size"] = 20
+        view.s_objects[0]["alignment"] = "left"
+        view.show_content(top_texts(), img_bg,
+                          refresh=top_texts,
+                          refresh_interval_s=refresh_interval_s)
 
     def start_playlist_view(self, img_bg):
         logging.info("Starting playlist view")
@@ -1926,6 +1984,8 @@ class Display:
         if not self.playlist:
             return 0
 
+        self.playlist.stop_browser()
+
         started = 0
         for item in self.playlist.playlist:
             if not item.get("enabled", True):
@@ -2191,8 +2251,8 @@ class Display:
 
         metrics.set("iss_display_windows", len(all_windows), state="total")
         metrics.set("iss_display_windows", len(rotating), state="rotating")
-        metrics.set("iss_display_browser_up",
-                    1 if any(w.get("app_id") == "firefox" for w in all_windows) else 0)
+        running = self.playlist.browser_running() if self.playlist else False
+        metrics.set("iss_display_browser_up", 1 if running else 0)
 
         metrics.clear_gauge("iss_display_surface_commits_total")
         metrics.clear_gauge("iss_display_frames_presented_total")
@@ -2579,7 +2639,8 @@ class HtmlPage:
 
         table = [
             "<table>",
-            "<thead><tr><th>#</th><th>URI</th><th>Player</th><th>Time (s)</th><th>State</th><th></th></tr></thead>",
+            "<thead><tr><th>#</th><th>URI</th><th>Player</th><th>Time (s)</th>"
+            "<th>Refresh (s)</th><th>State</th><th></th></tr></thead>",
             "<tbody>",
         ]
         for item in playlist_items:
@@ -2587,14 +2648,15 @@ class HtmlPage:
             uri = str(item.get('uri', ''))
             player = str(item.get('player', ''))
             play_time_s = str(item.get('play_time_s', ''))
+            refresh_s = str(item.get('refresh_s') or "")
             enabled = "enabled" if item.get('enabled', True) else "disabled"
             toggle = (f"<button onclick=\"toggleItem({html.escape(num)}, this)\">"
                       f"{'disable' if item.get('enabled', True) else 'enable'}</button>")
             table.append(
-                f"<tr><td>{html.escape(num)}</td><td>{html.escape(uri)}</td><td>{html.escape(player)}</td><td>{html.escape(play_time_s)}</td><td class=\"state\">{html.escape(enabled)}</td><td>{toggle}</td></tr>"
+                f"<tr><td>{html.escape(num)}</td><td>{html.escape(uri)}</td><td>{html.escape(player)}</td><td>{html.escape(play_time_s)}</td><td>{html.escape(refresh_s)}</td><td class=\"state\">{html.escape(enabled)}</td><td>{toggle}</td></tr>"
             )
         table.append("</tbody>")
-        table.append('<tfoot><tr><td colspan="5"></td>'
+        table.append('<tfoot><tr><td colspan="6"></td>'
                      '<td><button onclick="addItem()" title="Add an item">+</button></td>'
                      '</tr></tfoot>')
         table.append("</table>")
