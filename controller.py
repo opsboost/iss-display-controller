@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import requests
 import collections
+import colorsys
 import functools
 from functools import partial
 import cairocffi as cairo
@@ -311,6 +312,18 @@ def parse_colour(value):
 
 def hex_colour(rgb):
     return "#%02x%02x%02x" % tuple(rgb)
+
+# A highlight in the complementary hue to the background, kept vivid but not
+# garish, and light or dark to sit against whichever the body text is not
+def harmonious_accent(bg_rgb, font_rgb):
+    h, _, s = colorsys.rgb_to_hls(*(c / 255 for c in bg_rgb))
+    font_l = colorsys.rgb_to_hls(*(c / 255 for c in font_rgb))[1]
+    h = (h + 0.5) % 1.0
+    s = 0.65 if s < 0.15 else max(0.5, min(0.8, s))
+    l = 0.6 if font_l >= 0.5 else 0.42
+
+    return hex_colour(tuple(round(c * 255)
+                            for c in colorsys.hls_to_rgb(h, l, s)))
 
 # A monospace two-column block, key left and value right, the shape the status
 # views share. Blank values are dropped and a multi-line value keeps its extra
@@ -1258,14 +1271,18 @@ def draw_calendar():
     day name, with the next bank holidays underneath.
     """
     # The month lines come from doi; the pango markup for the highlights is
-    # ours, since it belongs to this renderer
+    # ours, since it belongs to this renderer. Colours come from the theme
+    accent = theme.highlight_colour
+    body = theme.font_colour
+    face = theme.font_face or "Monospace"
+
     def highlight(match):
-        return ('</span><span foreground="orange" font="Monospace 23">'
+        return (f'</span><span foreground="{accent}" font="{face} 23">'
                 f'{match.group(0)}</span>'
-                '<span foreground="white" font="Monospace 20">')
+                f'<span foreground="{body}" font="{face} 20">')
 
     def highlight_day_name(match):
-        return (f'<span foreground="orange" font="Monospace 23">'
+        return (f'<span foreground="{accent}" font="{face} 23">'
                 f'{match.group(0)}</span>')
 
     if hasattr(Calendar, "month_text"):
@@ -1333,10 +1350,26 @@ class Zeroconf_service:
 
 class Theme:
 
+    default_bg_colour = "#280f28"
+    default_font_colour = "#ffffff"
+
     def __init__(self, name="default"):
         self.name = name
         self.font = ""
         self.font_face = "Monospace"
+
+        self.bg_colour = os.environ.get("THEME_BG_COLOUR",
+                                       self.default_bg_colour)
+        self.font_colour = os.environ.get("THEME_FONT_COLOUR",
+                                          self.default_font_colour)
+        # A complementary accent for the bits a view wants to stand out, the
+        # calendar's current day among them; overridable, else derived
+        bg = parse_colour(self.bg_colour) or parse_colour(self.default_bg_colour)
+        fg = parse_colour(self.font_colour) \
+            or parse_colour(self.default_font_colour)
+        self.highlight_colour = os.environ.get(
+            "THEME_HIGHLIGHT_COLOUR", harmonious_accent(bg, fg))
+
         path = "themes/" + self.name + "/background.jpg"
         if os.path.exists(path):
             self.img_bg = path
@@ -2608,12 +2641,15 @@ class Wayland_view:
                 (i for i, it in enumerate(items)
                  if it.get("num") == item["num"]), None)
 
-        bg_r, bg_g, bg_b = 40, 15, 40
+        # The theme sets the view background and text colours; a per-item
+        # bg_colour from the web ui overrides the background
+        bg_r, bg_g, bg_b = parse_colour(theme.bg_colour) or (40, 15, 40)
         stored = (item or {}).get("bg_colour")
         if stored:
             parsed = parse_colour(stored)
             if parsed:
                 bg_r, bg_g, bg_b = parsed
+        fg_r, fg_g, fg_b = parse_colour(theme.font_colour) or (255, 255, 255)
 
         s_object = {"alignment": "center",
                     "offset_x": 10,
@@ -2625,9 +2661,9 @@ class Wayland_view:
                     "font": theme.font,
                     "font_face": theme.font_face,
                     "font_size": 60,
-                    "font_colour_r": 255,
-                    "font_colour_g": 255,
-                    "font_colour_b": 255,
+                    "font_colour_r": fg_r,
+                    "font_colour_g": fg_g,
+                    "font_colour_b": fg_b,
                     "file": "",
                     "img_scale_up": True,
                     "img_scale_down": True,
