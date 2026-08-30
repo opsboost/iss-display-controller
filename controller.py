@@ -465,6 +465,13 @@ def pip_scale():
 def pip_corner(item):
     return bool(item) and str(item.get("pip", "")).endswith("corner")
 
+pip_positions = ("lower-right", "lower-left", "upper-right", "upper-left")
+
+# Which corner of the output the small pip view sits in
+def pip_position():
+    p = os.environ.get("PIP_POSITION", "lower-right").strip().lower()
+    return p if p in pip_positions else "lower-right"
+
 # Whether the gstreamer this image ships has an element, so a pipeline branch
 # that needs one can be left out on an older build rather than failing whole
 @functools.lru_cache(maxsize=None)
@@ -3273,8 +3280,8 @@ class Display:
         return f"{self.workspace_prefix}{win_id}"
 
     # One workspace holds the whole pip layout: one window tiled so it fills
-    # the output, one floated over the bottom right corner. Which of the two
-    # is pinned and which cycles depends on where the double bar was
+    # the output, one floated over a corner. Which of the two is pinned and
+    # which cycles depends on where the double bar was
     pip_workspace = "iss-pip"
 
     # Tiled, so sway sizes it to fill the workspace
@@ -3289,20 +3296,21 @@ class Display:
                          self.window_workspace(previous_id), log_prefix="pip")
         self.swaymsg("workspace", self.pip_workspace, log_prefix="pip")
 
-    # Floated and sized to pip_scale() of the output, bottom right. Sticky so
-    # it stays on screen over whichever workspace the cycling set is showing,
-    # rather than depending on a move to pip_workspace landing while the
-    # compositor is still mapping the other windows. Fullscreen is dropped
-    # first: a fullscreen surface (waylandsink, a fullscreened browser)
+    # Floated and sized to pip_scale() of the output, in the pip_position()
+    # corner. Sticky so it stays on screen over whichever workspace the cycling
+    # set is showing, rather than depending on a move to pip_workspace landing
+    # while the compositor is still mapping the other windows. Fullscreen is
+    # dropped first: a fullscreen surface (waylandsink, a fullscreened browser)
     # ignores resize and move and stays stuck to its workspace
     def place_pip_corner(self, window, previous_id):
         wid = window["id"]
         pw = max(1, round(self.res_x * pip_scale()))
         ph = max(1, round(self.res_y * pip_scale()))
-        # One value, subtracted from both axes, so the gap to the right edge
-        # equals the gap to the bottom edge
+        # One value, so the gap to the near edges is equal on both axes
         margin = max(8, round(min(self.res_x, self.res_y) * 0.03))
-        x, y = self.res_x - pw - margin, self.res_y - ph - margin
+        pos = pip_position()
+        x = margin if pos.endswith("left") else self.res_x - pw - margin
+        y = margin if pos.startswith("upper") else self.res_y - ph - margin
 
         self.swaymsg(f"[con_id={wid}]", "fullscreen", "disable", log_prefix="pip")
         self.swaymsg(f"[con_id={wid}]", "floating", "enable", log_prefix="pip")
