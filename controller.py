@@ -7,7 +7,7 @@ from functools import partial
 import cairocffi as cairo
 import configargparse
 from doi import (APOD, Art, ArtMet, ArtNGA, Calendar, MQTT, Music, News, OTD,
-                 RSSFeed, System, Weather)
+                 PrometheusClient, RSSFeed, System, Weather)
 from qr_code_service import encode as encode_qr, QREncodeError
 import html
 import ipaddress
@@ -340,6 +340,10 @@ def kv_table(rows):
         lines.extend(f"{indent}  {line}" for line in rest)
 
     return "\n".join(lines)
+
+# A prometheus value is a float; show a whole number without the .0
+def fmt_number(v):
+    return str(int(v)) if float(v).is_integer() else f"{v:g}"
 
 def udp_family(host):
     try:
@@ -966,6 +970,7 @@ def screen(request):
         "listen_port": state.get('port'),
         "res_x": state.get('res_x'),
         "res_y": state.get('res_y'),
+        "pinned": state.get('pinned'),
         "playlist": playlist_items,
         "uris": [item.get("uri") for item in playlist_items],
         "streams": getattr(globals().get('stream'), "streams", []),
@@ -1106,6 +1111,9 @@ def api_next(request):
 def api_previous(request):
     return display_call("step_rotation", "step", -1)
 
+def api_pin(request):
+    return display_call("toggle_view_pin", "pin_view")
+
 def api_playlist_add(request):
     uri = request.query_params.get("uri")
     play_time_s = request.query_params.get("t")
@@ -1133,6 +1141,7 @@ app = Starlette(routes=[
     Route("/api/v1/shell", api_shell, methods=["POST"], name="api_shell"),
     Route("/api/v1/next", api_next, methods=["POST"], name="api_next"),
     Route("/api/v1/previous", api_previous, methods=["POST"], name="api_previous"),
+    Route("/api/v1/pin", api_pin, methods=["POST"], name="api_pin"),
     Route("/api/v1/playlist", api_playlist_add,
           methods=["POST"], name="api_playlist_add"),
     Route("/api/v1/playlist/{num:int}/toggle", api_playlist_toggle,
@@ -1498,6 +1507,7 @@ class Playlist:
                    "iss://news": "news",
                    "iss://onthisday": "onthisday",
                    "iss://playlist": "playlist",
+                   "iss://prometheus": "prometheus",
                    "iss://shell": "shell",
                    "iss://system/dirsizes": "dirsizes",
                    "iss://system/filesizes": "filesizes",
@@ -1557,6 +1567,16 @@ class Playlist:
         if player in ("filesizes", "dirsizes"):
             wanted = uri[len(f"iss://system/{player}"):].strip()
             return {"scan_path": wanted if wanted.startswith("/") else "/"}
+        if player == "prometheus":
+            # iss://prometheus/<endpoint>/<metric>[,<metric>...]; the endpoint
+            # keeps its own path, so the metric names are the last segment
+            endpoint, _, wanted = uri[len("iss://prometheus/"):].rpartition("/")
+            names = [n for n in wanted.split(",") if n]
+            if not endpoint or not names:
+                logging.warning(f"playlist: Dropping {uri}, want "
+                                "iss://prometheus/<url>/<metric>")
+                return None
+            return {"prom_url": endpoint, "prom_metrics": names}
         if player == "log":
             wanted = uri[len("iss://log"):].strip("/")
             try:
@@ -1693,6 +1713,9 @@ class Playlist:
                                                s.item_refresh_s(i)),
         "playlist":    lambda s, i, p: partial(s.start_playlist_view,
                                                s.theme.img_bg),
+        "prometheus":  lambda s, i, p: partial(s.start_prometheus_view,
+                                               i["prom_url"], i["prom_metrics"],
+                                               *s.refresh_args(i)),
         "system":      lambda s, i, p: partial(s.start_sys_view,
                                                s.theme.img_bg, p),
         "weather":     lambda s, i, p: partial(s.start_weather_view,
@@ -2095,6 +2118,33 @@ class Playlist:
         draw(log_texts(), method=method, img_bg=img_bg,
              font_sizes=[16], alignment="left", title="Log",
              refresh=log_texts, refresh_interval_s=refresh_interval_s)
+
+    # iss://prometheus/<endpoint>/<metric>[,<metric>...] -- fetch those metrics
+    # from a /metrics endpoint and show each series as a key/value row
+    def start_prometheus_view(self, url, metrics, img_bg,
+                              refresh_interval_s=10, method="python-wayland"):
+        client = PrometheusClient(url)
+
+        # Underscores out of the metric name for a readable key, but not out
+        # of the labels -- a path label is real data
+        def label(series):
+            name, brace, rest = series.partition("{")
+            return name.replace("_", " ") + brace + rest
+
+        def rows():
+            data = client.values(*metrics)
+            if data:
+                pairs = [(label(series), fmt_number(value))
+                         for series, value in sorted(data.items())]
+            else:
+                pairs = [(name.replace("_", " "), "no data")
+                         for name in metrics]
+
+            return [kv_table(pairs)]
+
+        draw(rows(), method=method, img_bg=img_bg, font_sizes=[20],
+             alignment="left", title="Prometheus",
+             refresh=rows, refresh_interval_s=refresh_interval_s)
 
     def start_playlist_view(self, img_bg):
         items = get_playlist_items()
@@ -2838,6 +2888,9 @@ class Display:
         self.window_blacklist = list()
         self.rotation_index = 0
         self.rotation_step = 0
+        # Pinned holds the rotation on the current view; the view keeps
+        # refreshing on its own clock, only the automatic advance stops
+        self.pinned = False
         self.current_num = None
         self.pip_pinned_num = None
         self.pip_pinned_corner = False
@@ -2923,6 +2976,8 @@ class Display:
                 'port': self.port,
                 'res_x': self.res_x,
                 'res_y': self.res_y,
+                'pinned': self.pinned,
+                'current_num': self.current_num,
                 'playlist_name': self.playlist.name if self.playlist else "",
                 'default_play_time_s': (self.playlist.default_play_time_s
                                         if self.playlist else 0)}
@@ -2942,6 +2997,7 @@ class Display:
             'GET_PLAYLIST': lambda: {'playlist': self.playlist_items()},
             'NEXT': lambda: self.step_rotation(1),
             'PREVIOUS': lambda: self.step_rotation(-1),
+            'pin-view': lambda: self.toggle_view_pin(),
         }
         commands = {
             'DEFAULT_TIME': self.set_default_play_time,
@@ -3067,6 +3123,10 @@ class Display:
     def step(direction, host=None, port=None, timeout=2.0):
         return Display.send_command('NEXT' if direction > 0 else 'PREVIOUS',
                                     host, port, timeout)
+
+    @staticmethod
+    def pin_view(host=None, port=None, timeout=2.0):
+        return Display.send_command('pin-view', host, port, timeout)
 
     @staticmethod
     def set_default_time(play_time_s, host=None, port=None, timeout=2.0):
@@ -3931,6 +3991,16 @@ class Display:
 
         return {"step": step}
 
+    # Freeze or resume the rotation on the current view. A manual next/previous
+    # still moves while pinned; only the timed advance is held
+    def toggle_view_pin(self):
+        self.pinned = not self.pinned
+        self.skip_event.set()
+        logging.info(f"display: rotation {'pinned' if self.pinned else 'resumed'}"
+                     f" on view {self.current_num}")
+
+        return {"pinned": self.pinned, "num": self.current_num}
+
     def window_pip(self, window):
         return str((self.window_item(window) or {}).get("pip", ""))
 
@@ -4000,6 +4070,12 @@ class Display:
             shown_from = time.time()
             self.skip_event.wait(play_time_s)
             self.skip_event.clear()
+
+            # Pinned: hold here, the view refreshes itself. A manual step
+            # (rotation_step set) still gets through
+            if self.pinned and not self.rotation_step:
+                continue
+
             metrics.inc("iss_display_item_shown_seconds_total",
                         time.time() - shown_from, **labels)
             self.advance_item(item.get("num"))
@@ -4054,6 +4130,11 @@ class Display:
         shown_from = time.time()
         self.skip_event.wait(play_time_s)
         self.skip_event.clear()
+
+        # Pinned: hold on this view; its own refresh timer keeps it current
+        if self.pinned and not self.rotation_step:
+            return shown_id
+
         metrics.inc("iss_display_item_shown_seconds_total",
                     time.time() - shown_from, **labels)
         self.advance_item(item.get("num"))
@@ -4287,6 +4368,8 @@ body {
 /* The gap closes the transport group off from the rest, so it goes
    after the last of them rather than after play */
 .controls #next-btn { margin-right: 1.5em; }
+.controls #pin-btn svg { display: block; width: 1em; height: 1em; fill: currentColor; }
+.controls #pin-btn.pinned { background: #fff; color: #000; opacity: 1; }
 .controls input[type="color"] {
     position: absolute;
     width: 1px;
@@ -4442,6 +4525,14 @@ function togglePause(btn){
   btn.title = paused ? "Play" : "Pause";
 }
 
+async function togglePin(btn){
+  const data = await api("/api/v1/pin");
+  if(!data) return;
+  btn.classList.toggle("pinned", data.pinned);
+  btn.title = data.pinned ? "Unpin view (resume the rotation)"
+                          : "Pin view (stop the rotation)";
+}
+
 async function saveScreenshot(){
   const blob = await fetchShot();
   if(!blob) return;
@@ -4546,6 +4637,7 @@ const controlActions = {
   "prev-btn": () => fetch("/api/v1/previous", {method: "POST"}),
   "next-btn": () => fetch("/api/v1/next", {method: "POST"}),
   "pause-btn": togglePause,
+  "pin-btn": togglePin,
   "shot-btn": saveScreenshot,
   "fs-btn": toggleFullscreen,
   "res-btn": () => resMenu.classList.toggle("open"),
@@ -4627,6 +4719,15 @@ still.addEventListener("load", ambilight);
 setInterval(ambilight, 2000);
 ambilight();
 
+// Reflect a pin set from anywhere (udp, another client) on load
+fetch("/api/v1/display").then(r => r.ok && r.json()).then(d => {
+  if(d && d.pinned){
+    const b = document.getElementById("pin-btn");
+    b.classList.add("pinned");
+    b.title = "Unpin view (resume the rotation)";
+  }
+}).catch(() => {});
+
 async function refreshScreenshot(){
   if(paused) return;
   const blob = await fetchShot();
@@ -4673,6 +4774,7 @@ setTimeout(() => { if(!video.videoWidth) useStills("no frames"); }, 8000);
   <div class="controls">
     <button id="prev-btn" title="Previous">⏮</button>
     <button id="pause-btn" title="Pause">⏸</button>
+    <button id="pin-btn" title="Pin view (stop the rotation)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4V2H6v2h1l1 6-3 2v2h5v6l1 2 1-2v-6h5v-2l-3-2 1-6h1z"/></svg></button>
     <button id="next-btn" title="Next">⏭</button>
     <button id="shot-btn" title="Save screenshot">⤓</button>
     <button id="fs-btn" title="Fullscreen">⛶</button>
