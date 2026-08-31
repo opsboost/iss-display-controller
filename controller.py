@@ -1184,8 +1184,10 @@ def image_caption(meta, source):
     return str(meta or "")
 
 # A full-bleed image with a centred line above and a caption below, the shape
-# the apod and museum views share
-def draw_captioned_image(img_path, caption, bg_colour=None):
+# the apod and museum views share. Black behind the letterboxing rather than
+# transparent, or the sway backdrop shows through if the window is ever seen
+# before the rotation has placed it
+def draw_captioned_image(img_path, caption, bg_colour="#000000"):
     wv = Wayland_view(display.res_x, display.res_y, 2, theme)
     wv.s_objects[0]["font_size"] = 20
     wv.s_objects[0]["alignment"] = "center"
@@ -3290,6 +3292,13 @@ class Display:
     # Float every window we spawn. Our views set a fixed size and ignore the
     # size the compositor asks them to take, so tiling them, which resizes
     # them to fill their workspace, leaves the buffer and the window disagreeing
+    # New windows map onto the focused workspace, which after start-up is the
+    # one a view is showing on -- a slow view (art waits on a museum fetch)
+    # then floats over the live picture until the rotation reaches it. Every
+    # window we cycle maps here first instead, off screen, and the rotation
+    # moves it out when its turn comes
+    holding_workspace = "iss-holding"
+
     def set_window_rules(self):
         try:
             self.swaymsg('for_window', '[app_id=".*"]', 'floating', 'enable',
@@ -3298,7 +3307,11 @@ class Display:
             # 25px off the top of a tiled one
             self.swaymsg('for_window', '[app_id=".*"]', 'border', 'none',
                          log_prefix="set_window_rules")
-            logging.info("display: Set new windows to float")
+            for app_id in self.window_app_ids:
+                self.swaymsg('for_window', f'[app_id="{app_id}"]', 'move',
+                             'to', 'workspace', self.holding_workspace,
+                             log_prefix="set_window_rules")
+            logging.info("display: Set new windows to float, off screen")
 
             # servoshell draws its own toolbar, and there is no flag or pref in
             # servo 0.4.0 to turn that off, but the compositor fullscreening the
