@@ -6,8 +6,8 @@ import functools
 from functools import partial
 import cairocffi as cairo
 import configargparse
-from doi import (APOD, Art, ArtMet, ArtNGA, Calendar, MQTT, Music, News, OTD,
-                 PrometheusClient, RSSFeed, System, Weather)
+from doi import (APOD, Art, ArtMet, ArtNGA, Bluesky, Calendar, MQTT, Music,
+                 News, OTD, PrometheusClient, RSSFeed, System, Weather)
 from qr_code_service import encode as encode_qr, QREncodeError
 import html
 import ipaddress
@@ -16,6 +16,7 @@ import logging
 import math
 import os
 from pathlib import Path
+from PIL import Image, UnidentifiedImageError
 import platform
 import re
 import secrets
@@ -34,8 +35,8 @@ from starlette.routing import Match, Route
 import sys
 import time
 import threading
-import urllib.request
-from urllib.parse import unquote_plus, urlsplit, urlunsplit
+import tomllib
+from urllib.parse import unquote_plus, urljoin, urlsplit, urlunsplit
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
 import wayland.protocol
@@ -70,7 +71,7 @@ env = os.environ.copy()
 stream_sources = ["static-images", "v4l2", "vnc-browser", "mosaic"]
 cmds = {"clock":        "humanbeans_clock",
         "media_player": "gst-launch-1.0",
-        "servoshell":   "servoshell",
+        "servo":        "servo",
         "compositor":   "sway",
         "scream":       os.environ.get("SCREAM_BIN", "scream"),
         "wayvnc":       os.environ.get("WAYVNC_BIN", "wayvnc"),
@@ -95,7 +96,9 @@ metric_meta = {
     "iss_display_item_enabled": ("gauge", "Whether a playlist item is enabled"),
     "iss_display_item_play_time_seconds": ("gauge", "Configured play time per item"),
     "iss_display_windows": ("gauge", "Windows known to the compositor, by state"),
-    "iss_display_sockets": ("gauge", "Open sockets, by protocol and state"),
+    "iss_display_sockets": ("gauge", "Live sockets (LISTEN, ESTABLISHED, connecting), by protocol and state"),
+    "iss_display_sockets_transient": ("gauge", "Sockets in a closing or wait state (TIME_WAIT etc), by protocol and state"),
+    "iss_display_sockets_total": ("gauge", "All sockets seen this scrape, live and transient"),
     "iss_display_content_age_seconds": ("gauge", "Age of the content a view is showing"),
     "iss_display_content_ticks_total": ("counter", "Refresh timer ticks handled"),
     "iss_display_content_refreshes_total": ("counter", "Content refreshes that redrew"),
@@ -103,6 +106,8 @@ metric_meta = {
     "iss_display_rss_items": ("gauge", "Items parsed from an RSS feed"),
     "iss_display_swaymsg_errors_total": ("counter", "swaymsg calls that wrote to stderr"),
     "iss_display_state_commands_total": ("counter", "State socket commands served"),
+    "iss_display_state_rate_limited_total": ("counter", "State socket datagrams the rate limiter refused, by scope"),
+    "iss_display_state_rate_limited_clients": ("gauge", "Distinct source addresses the rate limiter has refused"),
     "iss_display_browser_up": ("gauge", "Whether a browser window is present"),
     "iss_display_compositor_up": ("gauge", "Whether the compositor is running"),
     "iss_display_stream_up": ("gauge", "Whether the stream server is running"),
@@ -287,6 +292,13 @@ content_refreshers_lock = threading.Lock()
 def playlist_item():
     return getattr(threading.current_thread(), "playlist_item", None)
 
+# A playlist item holds a live fetcher under one of these keys; drop them
+# before the item is sent as json
+item_fetcher_keys = ("news", "bluesky")
+
+def public_item(item):
+    return {k: v for k, v in item.items() if k not in item_fetcher_keys}
+
 def view_num():
     item = playlist_item()
 
@@ -383,7 +395,10 @@ def terminate_process(proc, name, timeout_s=5):
     except subprocess.TimeoutExpired:
         logging.warning(f"{name}: Did not stop, killing it")
         proc.kill()
-        proc.wait(timeout=timeout_s)
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            logging.warning(f"{name}: Still running after kill, leaving it to the kernel")
 
 def spawn(cmd, **kwargs):
     """Start a long-running child with the shared defaults: the controller's
@@ -537,31 +552,51 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
 # header line carries the position as 1/2, 2/2. The first line is the column
 # header and repeats on every page
 def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
-                    method="python-wayland", font_size=14, page_lines=24):
+                    method="python-wayland", font_size=14, page_lines=24,
+                    split=False):
     state = {"page": 0}
 
-    # A row longer than the view is clipped rather than wrapped: a wrapped
-    # tail starts under the first column and breaks the table. A monospace
-    # glyph is about 0.8px per point wide, and the layout keeps a 40px
-    # margin on each side
+    # A monospace glyph is about 0.8px per point wide and the layout keeps a
+    # 40px margin on each side. A row past that width is clipped rather than
+    # wrapped, since a wrapped tail starts under the first column and breaks
+    # the table. split=True instead drops the overflow to one indented
+    # continuation line, broken on a space, and clips that
     max_chars = max(20, int((display.res_x - 80) / (font_size * 0.8)))
 
-    def clip(line):
-        return line if len(line) <= max_chars else line[:max_chars - 1] + "…"
+    def fit(line):
+        if len(line) <= max_chars:
+            return [line]
+        if not split:
+            return [line[:max_chars - 1] + "…"]
+        cut = line.rfind(" ", 8, max_chars)
+        if cut <= max_chars // 2:
+            cut = max_chars
+        tail = line[cut:].strip()
+        if len(tail) > max_chars - 4:
+            tail = tail[:max_chars - 5] + "…"
+        return [line[:cut].rstrip(), "    " + tail]
 
     def texts():
         lines = lines_fn()
         if not lines:
             return [f"No {title.lower()} data"]
 
-        head, rows = clip(lines[0]), [clip(row) for row in lines[1:]]
-        pages = [rows[n:n + page_lines]
-                 for n in range(0, len(rows), page_lines)] or [[]]
+        head = fit(lines[0])[0]
+        blocks = [fit(row) for row in lines[1:]]
+        pages, cur = [], []
+        for block in blocks:
+            if cur and len(cur) + len(block) > page_lines:
+                pages.append(cur)
+                cur = []
+            cur.extend(block)
+        if cur:
+            pages.append(cur)
+        pages = pages or [[]]
         page = state["page"] % len(pages)
         state["page"] = page + 1
         counter = "" if len(pages) == 1 else f" {page + 1}/{len(pages)}"
 
-        return ["\n".join([f"{title}{counter} ({len(rows)})", "", head]
+        return ["\n".join([f"{title}{counter} ({len(blocks)})", "", head]
                           + pages[page])]
 
     draw(texts(), method=method, img_bg=img_bg, font_sizes=[font_size],
@@ -581,7 +616,11 @@ def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
         # leaves vju at its own default size
         cmd = [cmds["vju"], "--fullscreen",
                "--width", str(round(display.res_x * scale)),
-               "--height", str(round(display.res_y * scale))]
+               "--height", str(round(display.res_y * scale)),
+               # so a vju view matches the themed python-wayland ones
+               "--text-color", theme.font_colour]
+        if not img_bg:
+            cmd += ["--background-color", theme.bg_colour]
         if alignment == "center":
             cmd.append("--center-text")
         if font_sizes:
@@ -1114,6 +1153,12 @@ def api_previous(request):
 def api_pin(request):
     return display_call("toggle_view_pin", "pin_view")
 
+def api_media_next(request):
+    return display_call("media_step", "media_next", 1)
+
+def api_media_previous(request):
+    return display_call("media_step", "media_next", -1)
+
 def api_playlist_add(request):
     uri = request.query_params.get("uri")
     play_time_s = request.query_params.get("t")
@@ -1142,6 +1187,10 @@ app = Starlette(routes=[
     Route("/api/v1/next", api_next, methods=["POST"], name="api_next"),
     Route("/api/v1/previous", api_previous, methods=["POST"], name="api_previous"),
     Route("/api/v1/pin", api_pin, methods=["POST"], name="api_pin"),
+    Route("/api/v1/media/next", api_media_next,
+          methods=["POST"], name="api_media_next"),
+    Route("/api/v1/media/previous", api_media_previous,
+          methods=["POST"], name="api_media_previous"),
     Route("/api/v1/playlist", api_playlist_add,
           methods=["POST"], name="api_playlist_add"),
     Route("/api/v1/playlist/{num:int}/toggle", api_playlist_toggle,
@@ -1192,6 +1241,17 @@ def image_caption(meta, source):
 
     return str(meta or "")
 
+# PIL opens it -- so draw_image can too. Not every "picture of the day" is an
+# image: APOD is a video some days, and a downloaded embed page is not one
+# either, and Image.open on that kills the view thread
+def is_image_file(path):
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except (OSError, UnidentifiedImageError, ValueError):
+        return False
+
 # A full-bleed image with a centred line above and a caption below, the shape
 # the apod and museum views share. Black behind the letterboxing rather than
 # transparent, or the sway backdrop shows through if the window is ever seen
@@ -1201,6 +1261,13 @@ def draw_captioned_image(img_path, caption, bg_colour="#000000"):
     wv.s_objects[0]["font_size"] = 20
     wv.s_objects[0]["alignment"] = "center"
     wv.s_objects[1]["font_size"] = 20
+
+    if not img_path or not is_image_file(img_path):
+        logging.warning(f"view: {img_path} is not an image, showing the caption")
+        wv.s_objects[0]["alignment"] = "left"
+        wv.show_content([caption or "No picture today"])
+        return
+
     wv.set_texts(["", caption])
     wv.show_image(img_path, bg_colour=bg_colour)
 
@@ -1211,12 +1278,15 @@ def draw_apod():
     """
     key = globals().get('apod_api_key') or os.environ.get('APOD_API_KEY') or 'DEMO_KEY'
     img_path, meta = APOD(api_key=key).apod_data()
-    if not img_path or not meta:
+    if not meta:
         logging.error("Failed to fetch APOD data.")
         metrics.inc("iss_display_fetch_failures_total", source="apod")
         return
 
     caption = image_caption(meta, Art) if isinstance(meta, dict) else ""
+    # A video day has meta but no image; fall back to the caption and blurb
+    if not img_path and isinstance(meta, dict) and meta.get("description"):
+        caption = f"{caption}\n\n{meta['description']}".strip()
     draw_captioned_image(img_path, caption, bg_colour="#000000")
 
 # iss://system/filesizes/<path> and iss://system/dirsizes/<path>. The walk is
@@ -1359,20 +1429,79 @@ class Zeroconf_service:
         return True
 
 
+def load_toml_table(filename, name):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, filename), os.path.abspath(filename)):
+        try:
+            with open(path, "rb") as f:
+                return tomllib.load(f).get(name, {})
+        except FileNotFoundError:
+            continue
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            logging.warning(f"config: Could not read {path}: {e}")
+
+            return {}
+
+    return {}
+
+
+theme_env_vars = {
+    "bg_colour": "THEME_BG_COLOUR",
+    "font_colour": "THEME_FONT_COLOUR",
+    "highlight_colour": "THEME_HIGHLIGHT_COLOUR",
+    "font": "THEME_FONT",
+    "font_face": "THEME_FONT_FACE",
+    "pip_size": "RELATIVE_PIP_SIZE",
+    "pip_position": "PIP_POSITION",
+    "view_indicator": "VIEW_INDICATOR",
+    "view_indicator_colour": "THEME_VIEW_INDICATOR_COLOUR",
+}
+
+def apply_theme(name):
+    for key, value in load_toml_table("themes.toml", name).items():
+        var = theme_env_vars.get(key)
+        if var is None:
+            logging.warning(f"theme: {name} sets unknown key {key}")
+
+            continue
+        if isinstance(value, bool):
+            value = "1" if value else "0"
+        os.environ.setdefault(var, str(value))
+
+def playlist_uris(name):
+    name = str(name or "")
+    if "://" in name:
+        return [name]
+    uris = load_toml_table("playlists.toml", name).get("uris", [])
+
+    return [os.path.expandvars(str(uri)) for uri in uris]
+
+if __name__ != "__main__":
+    apply_theme(os.environ.get("THEME", "infinit"))
+    if not (os.environ.get("URI") or os.environ.get("URIS")):
+        os.environ["URI"] = "|".join(
+            playlist_uris(os.environ.get("PLAYLIST", "infinit")))
+
+
 class Theme:
 
     default_bg_colour = "#280f28"
-    default_font_colour = "#ffffff"
+    # Not pure white: a hair off full brightness reads with less halation on a
+    # panel and re-encodes with fewer ringing artefacts in scream's stream.
+    # Override with THEME_FONT_COLOUR
+    default_font_colour = "#ededed"
 
     def __init__(self, name="default"):
         self.name = name
-        self.font = ""
-        self.font_face = "Monospace"
+        self.font = os.environ.get("THEME_FONT", "")
+        self.font_face = os.environ.get("THEME_FONT_FACE", "Monospace")
 
         self.bg_colour = os.environ.get("THEME_BG_COLOUR",
                                        self.default_bg_colour)
         self.font_colour = os.environ.get("THEME_FONT_COLOUR",
                                           self.default_font_colour)
+        self.view_indicator_colour = os.environ.get(
+            "THEME_VIEW_INDICATOR_COLOUR", self.font_colour)
         # A complementary accent for the bits a view wants to stand out, the
         # calendar's current day among them; overridable, else derived
         bg = parse_colour(self.bg_colour) or parse_colour(self.default_bg_colour)
@@ -1408,6 +1537,10 @@ class Playlist:
         self.probe_ip_address = None
         self.browser = None
         self.media_player = None
+        # When the media item is an .m3u, its entries and the one playing now,
+        # so media_step can move through them
+        self.media_entries = []
+        self.media_index = 0
         self.playlist = self.create(uris)
 
     our_params = ("t", "enabled", "refresh", "method")
@@ -1495,12 +1628,14 @@ class Playlist:
     # sub-paths are listed before network
     uri_players = {"iss://apod": "apod",
                    "iss://art": "art",
+                   "iss://bluesky": "bluesky",
                    "iss://calendar": "calendar",
                    "iss://clock": "clock",
                    "iss://date": "date",
                    "iss://log": "log",
                    "iss://mqtt": "mqtt",
                    "iss://music": "music",
+                   "iss://network/neighbours": "neighbours",
                    "iss://network/sockets": "sockets",
                    "iss://network/traceroute": "traceroute",
                    "iss://network": "network",
@@ -1557,6 +1692,13 @@ class Playlist:
         if player == "onthisday":
             self.otd = OTD({"wikipedia": ""})
             return {}
+        if player == "bluesky":
+            # iss://bluesky/@handle or iss://bluesky/handle
+            actor = uri[len("iss://bluesky/"):].strip().lstrip("@")
+            if not actor:
+                logging.warning(f"playlist: Dropping {uri}, no bluesky handle")
+                return None
+            return {"bluesky": Bluesky(actor)}
         if player == "weather":
             self.weather = Weather(self.location)
             return {}
@@ -1702,8 +1844,14 @@ class Playlist:
         "music":       lambda s, i, p: partial(s.start_music_view,
                                                s.theme.img_bg,
                                                s.item_refresh_s(i)),
+        "bluesky":     lambda s, i, p: partial(s.start_bluesky_view,
+                                               i["bluesky"],
+                                               s.theme.img_bg,
+                                               s.item_refresh_s(i)),
         "network":     lambda s, i, p: partial(s.start_net_view,
                                                s.theme.img_bg, p),
+        "neighbours":  lambda s, i, p: partial(s.start_neighbours_view,
+                                               *s.refresh_args(i)),
         "news":        lambda s, i, p: partial(s.start_news_view,
                                                i.get("news") or s.news,
                                                s.theme.img_bg,
@@ -1712,7 +1860,7 @@ class Playlist:
                                                s.theme.img_bg,
                                                s.item_refresh_s(i)),
         "playlist":    lambda s, i, p: partial(s.start_playlist_view,
-                                               s.theme.img_bg),
+                                               *s.refresh_args(i)),
         "prometheus":  lambda s, i, p: partial(s.start_prometheus_view,
                                                i["prom_url"], i["prom_metrics"],
                                                *s.refresh_args(i)),
@@ -1772,13 +1920,14 @@ class Playlist:
 
         return True
 
-    # servoshell renders the page itself, with no driver in between. It cannot
-    # be scripted, so a page needing a login wants the firefox engine
+    # servo renders the page itself, with no driver in between. It cannot
+    # be scripted, so a page needing a login wants the firefox engine. This
+    # is the chromeless flavour, so there is no minibrowser toolbar to hide
     @staticmethod
     def browser_servo(urls):
         # Sized like the other players: everything we spawn is floated, and a
         # floating window is given the size it asks for
-        cmd = [cmds["servoshell"],
+        cmd = [cmds["servo"],
                "--no-native-titlebar",
                f"--window-size={display.res_x}x{display.res_y}",
                f"--screen-size={display.res_x}x{display.res_y}"]
@@ -1887,8 +2036,10 @@ class Playlist:
             return url, None
         lines = text.splitlines()
 
+        # Resolve against the master's url: some masters use a bare filename,
+        # others a /-rooted path
         def absolute(u):
-            return u if "://" in u else url.rsplit("/", 1)[0] + "/" + u
+            return urljoin(url, u)
 
         best = None
         for i, line in enumerate(lines):
@@ -1936,19 +2087,59 @@ class Playlist:
                     if l.strip() and not l.startswith("#")), "")
         return seg.split("?", 1)[0].lower().endswith((".ts", ".m2ts"))
 
+    # The stream urls in an .m3u (an IPTV channel list), each paired with the
+    # name from its #EXTINF line
+    @staticmethod
+    def m3u_entries(url):
+        try:
+            text = requests.get(url, timeout=15).text
+        except requests.RequestException as e:
+            logging.error(f"mediaplayer: fetching {url}: {e}")
+
+            return []
+
+        entries, name = [], ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#EXTINF"):
+                name = line.rpartition(",")[2].strip()
+            elif line.startswith("#"):
+                continue
+            else:
+                entries.append((name or line, line))
+                name = ""
+
+        return entries
+
     def start_mediaplayer(self, url):
+        self.media_entries = []
+        self.media_index = 0
         if url.endswith(".m3u"):
-            try:
-                text = requests.get(url, timeout=15).text
-            except requests.RequestException as e:
-                logging.error(f"mediaplayer: fetching {url}: {e}")
-                return None
-            url = next((line.strip() for line in text.splitlines()
-                        if line.strip() and not line.startswith("#")), None)
-            if not url:
+            self.media_entries = self.m3u_entries(url)
+            if not self.media_entries:
                 logging.error("mediaplayer: playlist has no stream entry")
                 return None
+            url = self.media_entries[0][1]
 
+        return self._play_media(url)
+
+    # Restart the media player on the next (+1) or previous (-1) entry of the
+    # current .m3u. Does nothing when the media item is a single stream
+    def media_step(self, direction):
+        n = len(self.media_entries)
+        if n < 2:
+            return {"error": "the media item has no playlist"}
+
+        self.media_index = (self.media_index + direction) % n
+        name, url = self.media_entries[self.media_index]
+        logging.info(f"mediaplayer: playlist {self.media_index + 1}/{n} {name}")
+        self._play_media(url)
+
+        return {"index": self.media_index, "count": n, "name": name}
+
+    def _play_media(self, url):
         audio_url = None
         if url.endswith(".m3u8"):
             url, audio_url = self.hls_sources(url)
@@ -1976,9 +2167,14 @@ class Playlist:
         # hlsdemux does not follow on its own
         # MEDIA_PIPELINE replaces the whole pipeline, {url} substituted
         # A corner pip takes its size from the compositor, so only a full
-        # view asks the sink for fullscreen
+        # view asks the sink for fullscreen. Read the role off the playlist
+        # item rather than the thread, so media_step off the state socket
+        # gets it right too
+        media_item = next((i for i in (self.playlist or [])
+                           if i.get("player") == "mediaplayer"),
+                          playlist_item())
         sink = ["waylandsink", "sync=true"]
-        if not pip_corner(playlist_item()):
+        if not pip_corner(media_item):
             sink.insert(1, "fullscreen=true")
 
         audio_port = stream_audio_port()
@@ -2044,6 +2240,16 @@ class Playlist:
         draw_paged_view("Sockets",
                         lambda: (System.net_sockets() or "").splitlines(),
                         img_bg, refresh_interval_s, method=method)
+
+    def start_neighbours_view(self, img_bg, refresh_interval_s=5,
+                              method="python-wayland"):
+        def lines():
+            if not hasattr(System, "net_neighbours"):
+                return ["Neighbours view needs a newer doi"]
+            return (System.net_neighbours() or "").splitlines()
+
+        draw_paged_view("Neighbours", lines, img_bg, refresh_interval_s,
+                        method=method)
 
     def start_date_view(self, refresh_interval_s=1, title=None):
         draw([], method="vju", alignment="center", title=title,
@@ -2146,25 +2352,63 @@ class Playlist:
              alignment="left", title="Prometheus",
              refresh=rows, refresh_interval_s=refresh_interval_s)
 
-    def start_playlist_view(self, img_bg):
-        items = get_playlist_items()
-        if items:
-            lines = [f"{item['num']:>2}  {item['uri']:<40} {item['player']}" for item in items]
-            if self.name:
-                lines.insert(0, f"{self.name}\n")
-            text = "\n".join(lines)
-        else:
-            text = "Playlist unavailable"
-        wv = Wayland_view(display.res_x, display.res_y, 1, theme)
-        wv.s_objects[0]["font_size"] = 20
-        wv.s_objects[0]["alignment"] = "left"
-        wv.show_content([text], img_bg)
+    def start_playlist_view(self, img_bg, refresh_interval_s=5,
+                            method="python-wayland"):
+        font_size = 20
+        cols = max(48, int((display.res_x - 80) / (font_size * 0.8)))
+        page_lines = max(6, int((display.res_y - 120) / (font_size * 1.6)))
+        state = {"page": 0}
+
+        def entry_blocks():
+            items = get_playlist_items()
+            if not items:
+                return []
+            player_w = max((len(i["player"]) for i in items), default=6)
+            uri_w = max(24, cols - 4 - 1 - player_w)
+            blocks = []
+            for item in items:
+                uri = item["uri"]
+                head, tail = uri, ""
+                if len(uri) > uri_w:
+                    cut = uri.rfind("/", 1, uri_w)
+                    cut = cut + 1 if cut > 0 else uri_w
+                    head, tail = uri[:cut], uri[cut:]
+                    if len(tail) > uri_w:
+                        tail = tail[:uri_w - 1] + "…"
+                block = [f"{item['num']:>2}  {head:<{uri_w}} {item['player']}"]
+                if tail:
+                    block.append(f"{'':4}{tail}")
+                blocks.append(block)
+            return blocks
+
+        def texts():
+            blocks = entry_blocks()
+            if not blocks:
+                return ["Playlist unavailable"]
+            pages, cur = [], []
+            for block in blocks:
+                if cur and len(cur) + len(block) > page_lines:
+                    pages.append(cur)
+                    cur = []
+                cur.extend(block)
+            if cur:
+                pages.append(cur)
+            page = state["page"] % len(pages)
+            state["page"] = page + 1
+            name = self.name or "Playlist"
+            counter = "" if len(pages) == 1 else f" {page + 1}/{len(pages)}"
+            return ["\n".join([f"{name}{counter} ({len(blocks)})", ""]
+                              + pages[page])]
+
+        draw(texts(), method=method, img_bg=img_bg, font_sizes=[font_size],
+             alignment="left", title="Playlist",
+             refresh=texts, refresh_interval_s=refresh_interval_s)
 
     def start_proc_view(self, img_bg, refresh_interval_s=5,
                         method="python-wayland"):
         draw_paged_view("Processes",
                         lambda: (System.list_processes() or "").splitlines(),
-                        img_bg, refresh_interval_s, method=method)
+                        img_bg, refresh_interval_s, method=method, split=True)
 
     def start_sys_view(self, img_bg, probe_ip_address):
         net = System.net_data(probe_ip_address)
@@ -2317,6 +2561,43 @@ class Playlist:
 
         draw_item_view(fetch, render, [30, 20, 60, 20, 30], img_bg,
                        refresh_interval_s, source="news")
+
+    def start_bluesky_view(self, bsky, img_bg, refresh_interval_s):
+        num = view_num()
+
+        def fetch():
+            item = bsky.post_item()
+            if not item:
+                metrics.inc("iss_display_fetch_failures_total", source="bluesky")
+                metrics.inc("iss_display_empty_views_total",
+                            player="bluesky", num=num)
+            elif hasattr(bsky, "item_count"):
+                metrics.set("iss_display_rss_items", bsky.item_count(),
+                            feed=item.get("handle", "") or "unknown")
+
+            return item
+
+        def render(wv, item):
+            if not item:
+                return [f"@{bsky.actor}", "", "No posts", "", ""], [""]
+
+            name = item.get("feed", "")
+            handle = item.get("handle", "")
+            rank = item.get("rank")
+            header = f"{name}  @{handle}" if name and name != handle \
+                else f"@{handle}"
+            if rank:
+                header += f"  #{rank}"
+            text = item.get("text") or item.get("title", "")
+            link = item.get("link") or item.get("url", "")
+
+            # A post's picture, when it has one, alongside the qr; both are
+            # overlays draw_overlays scales and places bottom-right
+            return ([header, "", text, "", link],
+                    [wv.qr(link), item.get("image", "")])
+
+        draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
+                       refresh_interval_s, overlays=2, source="bluesky")
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
@@ -2692,6 +2973,9 @@ class Wayland_view:
             self.window["view_num"] = next(
                 (i for i, it in enumerate(items)
                  if it.get("num") == item["num"]), None)
+            self.window["view_indicator_rgb"] = (
+                parse_colour(theme.view_indicator_colour)
+                or parse_colour(Theme.default_font_colour))
 
         # The theme sets the view background and text colours; a per-item
         # bg_colour from the web ui overrides the background
@@ -2701,7 +2985,8 @@ class Wayland_view:
             parsed = parse_colour(stored)
             if parsed:
                 bg_r, bg_g, bg_b = parsed
-        fg_r, fg_g, fg_b = parse_colour(theme.font_colour) or (255, 255, 255)
+        fg_r, fg_g, fg_b = (parse_colour(theme.font_colour)
+                            or parse_colour(Theme.default_font_colour))
 
         s_object = {"alignment": "center",
                     "offset_x": 10,
@@ -2867,6 +3152,31 @@ class Wayland_view:
         self.create_window(w)
 
 
+# A refilling token bucket for rate limiting. allow() reports whether a token
+# is available, spend() consumes one -- kept separate so a caller can check
+# several buckets and only commit when all of them permit
+class TokenBucket:
+
+    def __init__(self, rate, burst):
+        self.rate = float(rate)
+        self.capacity = float(burst)
+        self.tokens = float(burst)
+        self.updated = time.monotonic()
+
+    def allow(self, now):
+        self.tokens = min(self.capacity,
+                          self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+
+        return self.tokens >= 1
+
+    def spend(self):
+        self.tokens -= 1
+
+    def idle(self):
+        return self.tokens >= self.capacity
+
+
 class Display:
 
     # The app_ids of the windows we spawn ourselves, the only ones we cycle
@@ -2877,6 +3187,13 @@ class Display:
     # Where the state server binds and where its clients look for it
     default_state_udp_host = "127.0.0.1"
     default_state_udp_port = 7042
+    # Token-bucket limits on the state socket: enough headroom for button
+    # presses and a metrics poll, tight enough that a stuck sender or a loop
+    # cannot thrash the display. Per source address and across all of them
+    state_rate_per_client = 5
+    state_burst_per_client = 10
+    state_rate_global = 20
+    state_burst_global = 40
 
     def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
@@ -2895,6 +3212,8 @@ class Display:
         self.pip_pinned_num = None
         self.pip_pinned_corner = False
         self.pip_pinned_id = None
+        self.pip_paused = False
+        self.media_step_gen = 0
         self.holding = dict()
         self.command = ""
         self.command_output = ""
@@ -2977,6 +3296,7 @@ class Display:
                 'res_x': self.res_x,
                 'res_y': self.res_y,
                 'pinned': self.pinned,
+                'pip_paused': self.pip_paused,
                 'current_num': self.current_num,
                 'playlist_name': self.playlist.name if self.playlist else "",
                 'default_play_time_s': (self.playlist.default_play_time_s
@@ -2998,6 +3318,10 @@ class Display:
             'NEXT': lambda: self.step_rotation(1),
             'PREVIOUS': lambda: self.step_rotation(-1),
             'pin-view': lambda: self.toggle_view_pin(),
+            'media-play-next': lambda: self.media_step(1),
+            'media-play-previous': lambda: self.media_step(-1),
+            'stop-pip': lambda: self.set_pip(False),
+            'start-pip': lambda: self.set_pip(True),
         }
         commands = {
             'DEFAULT_TIME': self.set_default_play_time,
@@ -3053,6 +3377,19 @@ class Display:
             sock.bind((bind_host, bind_port))
             self._state_server_sock = sock
 
+            # Buckets live in this thread, its only reader, so no lock. Client
+            # buckets are dropped once idle so the map cannot grow unbounded
+            # when the socket is not loopback-only
+            global_bucket = TokenBucket(self.state_rate_global,
+                                        self.state_burst_global)
+            client_buckets = {}
+            # Every source address the limiter has ever refused, kept for the
+            # unique-client gauge (not pruned like the buckets)
+            limited_clients = set()
+            metrics.set("iss_display_state_rate_limited_clients", 0)
+            last_prune = time.monotonic()
+            dropped_logged = 0.0
+
             while not self._state_server_stop.is_set():
                 try:
                     data, addr = self._state_server_sock.recvfrom(65535)
@@ -3067,6 +3404,37 @@ class Display:
                 msg = data.decode('utf-8', errors='ignore').strip()
                 if msg == 'STOP':
                     break
+
+                now = time.monotonic()
+                if now - last_prune > 60:
+                    client_buckets = {ip: b for ip, b in client_buckets.items()
+                                      if not b.idle()}
+                    last_prune = now
+
+                ip = addr[0]
+                client = client_buckets.get(ip)
+                if client is None:
+                    client = TokenBucket(self.state_rate_per_client,
+                                         self.state_burst_per_client)
+                    client_buckets[ip] = client
+
+                g_ok = global_bucket.allow(now)
+                c_ok = g_ok and client.allow(now)
+                if not (g_ok and c_ok):
+                    scope = "global" if not g_ok else "client"
+                    metrics.inc("iss_display_state_rate_limited_total",
+                                scope=scope)
+                    if ip not in limited_clients:
+                        limited_clients.add(ip)
+                        metrics.set("iss_display_state_rate_limited_clients",
+                                    len(limited_clients))
+                    if now - dropped_logged > 10:
+                        logging.warning(f"state socket: rate limit hit "
+                                        f"({scope}), dropping from {ip}")
+                        dropped_logged = now
+                    continue
+                global_bucket.spend()
+                client.spend()
 
                 reply = self.state_reply(msg)
                 if reply is not None:
@@ -3127,6 +3495,12 @@ class Display:
     @staticmethod
     def pin_view(host=None, port=None, timeout=2.0):
         return Display.send_command('pin-view', host, port, timeout)
+
+    @staticmethod
+    def media_next(direction=1, host=None, port=None, timeout=20.0):
+        cmd = 'media-play-next' if direction > 0 else 'media-play-previous'
+
+        return Display.send_command(cmd, host, port, timeout)
 
     @staticmethod
     def set_default_time(play_time_s, host=None, port=None, timeout=2.0):
@@ -3373,10 +3747,10 @@ class Display:
                              log_prefix="set_window_rules")
             logging.info("display: Set new windows to float, off screen")
 
-            # servoshell draws its own toolbar, and there is no flag or pref in
-            # servo 0.4.0 to turn that off, but the compositor fullscreening the
-            # window drops it. firefox fullscreens itself, so this only has to
-            # cover the browsers that do not
+            # servo is the chromeless build so it has no toolbar to hide, but
+            # fullscreening it still makes the page fill the output rather than
+            # sit at the requested window size. firefox fullscreens itself, so
+            # this only has to cover the browsers that do not
             for app_id in self.browser_app_ids:
                 self.swaymsg('for_window', f'[app_id="{app_id}"]',
                              'fullscreen', 'enable', log_prefix="set_window_rules")
@@ -3416,7 +3790,7 @@ class Display:
         pw = max(1, round(self.res_x * pip_scale()))
         ph = max(1, round(self.res_y * pip_scale()))
         # One value, so the gap to the near edges is equal on both axes
-        margin = max(8, round(min(self.res_x, self.res_y) * 0.03))
+        margin = max(12, round(min(self.res_x, self.res_y) * 0.04)) + 8
         pos = pip_position()
         x = margin if pos.endswith("left") else self.res_x - pw - margin
         y = margin if pos.startswith("upper") else self.res_y - ph - margin
@@ -3584,14 +3958,22 @@ class Display:
 
         sockets = System.net_socket_list() or []
 
-        # A socket's proto and state are a bounded label set, so the count
-        # by type stays a handful of series
+        # A socket's proto and state are a bounded label set, so the count by
+        # type stays a handful of series. The closing and wait states go to
+        # their own gauge: a TIME_WAIT holds no fd and clears itself in ~60s,
+        # so counting it as an open socket only makes loopback scrape churn
+        # look like a leak
+        transient_states = {"TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT1",
+                            "FIN_WAIT2", "CLOSING", "LAST_ACK", "CLOSE"}
         metrics.clear_gauge("iss_display_sockets")
+        metrics.clear_gauge("iss_display_sockets_transient")
         socket_counts = collections.Counter(
             (s.get("proto", "?"), s.get("state", "?")) for s in sockets)
         for (proto, state), count in socket_counts.items():
-            metrics.set("iss_display_sockets", count,
-                        proto=proto, state=state)
+            name = ("iss_display_sockets_transient" if state in transient_states
+                    else "iss_display_sockets")
+            metrics.set(name, count, proto=proto, state=state)
+        metrics.set("iss_display_sockets_total", len(sockets))
 
         scream_clients, snapshots_total = scream_metrics()
         metrics.clear_gauge("iss_display_stream_subscribers")
@@ -3696,8 +4078,7 @@ class Display:
         if not self.playlist:
             return []
 
-        return [{k: v for k, v in item.items() if k != "news"}
-                for item in self.playlist.playlist]
+        return [public_item(item) for item in self.playlist.playlist]
 
     def set_default_play_time(self, play_time_s):
         if not self.playlist:
@@ -3787,7 +4168,7 @@ class Display:
         if item.get("enabled", True):
             self.playlist.start_item(item)
 
-        return {k: v for k, v in item.items() if k != "news"}
+        return public_item(item)
 
     def toggle_playlist_item(self, num):
         try:
@@ -3991,6 +4372,44 @@ class Display:
 
         return {"step": step}
 
+    # Move the media player through its .m3u. The restart maps a fresh window,
+    # so place it as soon as the compositor shows it rather than waiting for
+    # the next rotation turn to notice
+    def media_step(self, direction):
+        if not self.playlist:
+            return {"error": "no playlist"}
+
+        result = self.playlist.media_step(direction)
+        if isinstance(result, dict) and "error" not in result:
+            self.media_step_gen += 1
+            threading.Thread(target=self._place_stepped_media,
+                             args=(self.media_step_gen, self.pip_pinned_id),
+                             daemon=True).start()
+
+        return result
+
+    def _place_stepped_media(self, gen, previous_id):
+        place = (self.place_pip_corner if self.pip_pinned_corner
+                 else self.place_pip_full)
+        deadline = time.time() + 15
+        while time.time() < deadline and gen == self.media_step_gen:
+            time.sleep(0.25)
+            if self.pip_pinned_num is None or self.pip_paused:
+                self.skip_event.set()
+
+                return
+            media = next((w for w in self.get_windows_whitelist()
+                          if (self.window_item(w) or {}).get("num")
+                          == self.pip_pinned_num), None)
+            if media is None or media["id"] in (previous_id, self.pip_pinned_id):
+                continue
+
+            self.pip_pinned_id = media["id"]
+            place(media, None)
+            logging.info(f"display: placed stepped media window {media['id']}")
+
+            return
+
     # Freeze or resume the rotation on the current view. A manual next/previous
     # still moves while pinned; only the timed advance is held
     def toggle_view_pin(self):
@@ -4000,6 +4419,30 @@ class Display:
                      f" on view {self.current_num}")
 
         return {"pinned": self.pinned, "num": self.current_num}
+
+    def park_pip_windows(self, windows):
+        for window in windows:
+            if not pip_corner(self.window_item(window) or {}):
+                continue
+            wid = window["id"]
+            self.swaymsg(f"[con_id={wid}]", "sticky", "disable", log_prefix="pip")
+            self.swaymsg(f"[con_id={wid}]", "move", "workspace",
+                         self.holding_workspace, log_prefix="pip")
+
+    # stop-pip holds the corner window off screen and lets the full slot run as
+    # a plain rotation; start-pip hands the layout back to pip_cycle
+    def set_pip(self, active):
+        if self.pip_pinned_num is None:
+            return {"error": "no pip in this playlist"}
+        self.pip_paused = not active
+        self.pip_pinned_id = None
+        if self.pip_paused:
+            self.park_pip_windows(self.get_windows_whitelist())
+        self.skip_event.set()
+        logging.info(f"display: pip {'resumed' if active else 'stopped'}")
+
+        return {"pip": "running" if active else "stopped",
+                "num": self.pip_pinned_num}
 
     def window_pip(self, window):
         return str((self.window_item(window) or {}).get("pip", ""))
@@ -4014,10 +4457,17 @@ class Display:
             windows = self.get_windows_whitelist()
             windows.sort(key=self.window_order)
 
-            if self.pip_pinned_num is not None:
+            if self.pip_pinned_num is not None and not self.pip_paused:
                 pip_shown_id = self.pip_cycle(windows, pip_shown_id, t_focus_s)
 
                 continue
+
+            # stop-pip: the corner window is parked, the full slot rotates on
+            # its own as a plain playlist
+            if self.pip_paused:
+                pip_shown_id = None
+                windows = [w for w in windows
+                           if not pip_corner(self.window_item(w) or {})]
 
             if not windows:
                 logging.debug("display: Found no windows to switch to")
@@ -4121,8 +4571,8 @@ class Display:
                   "num": item.get("num", 0)}
 
         if due["id"] != shown_id:
-            logging.info(f"display: PIP -> {due['id']} "
-                         f"({self.window_name(due)}) for {play_time_s}s")
+            logging.info(f"display: pip -> {str(due['id']).zfill(2)} "
+                         f"{self.window_name(due)} for {play_time_s}s")
             place_cycled(due, shown_id)
             metrics.inc("iss_display_window_switches_total", **labels)
             shown_id = due["id"]
@@ -4197,16 +4647,22 @@ def is_loopback_endpoint(endpoint):
     except ValueError:
         return False
 
+# Both scrapes below hit scream on the loopback on a timer. A shared session
+# keeps one connection alive across them instead of opening a fresh socket
+# per call and leaving a TIME_WAIT behind; scream serves /metrics and
+# /snapshot with keep-alive. The connection pool is thread-safe
+_scream_session = requests.Session()
+_scream_session.headers["Connection"] = "keep-alive"
+
 # scream's own /metrics: the per-stream-type client counts and the cumulative
 # snapshot request total. Empty counts and None on any failure so a scrape
 # never resets the counter
 def scream_metrics():
     clients, snapshots_total = {}, None
     try:
-        with urllib.request.urlopen(
-                f"http://127.0.0.1:{stream_http_port()}/metrics",
-                timeout=1) as r:
-            body = r.read().decode("utf-8", "ignore") if r.status == 200 else ""
+        r = _scream_session.get(
+            f"http://127.0.0.1:{stream_http_port()}/metrics", timeout=1)
+        body = r.text if r.status_code == 200 else ""
     except Exception as e:
         logging.debug(f"stream: no metrics from scream: {e}")
 
@@ -4250,13 +4706,13 @@ def snapshot_url():
 # request and the temp file with it
 def snapshot_bytes(timeout_s=5):
     try:
-        with urllib.request.urlopen(snapshot_url(), timeout=timeout_s) as r:
-            if r.status != 200:
-                logging.error(f"snapshot: {snapshot_url()} returned {r.status}")
+        r = _scream_session.get(snapshot_url(), timeout=timeout_s)
+        if r.status_code != 200:
+            logging.error(f"snapshot: {snapshot_url()} returned {r.status_code}")
 
-                return None
+            return None
 
-            return r.read()
+        return r.content
     except Exception as e:
         logging.error(f"snapshot: Failed to read {snapshot_url()}: {e}")
 
@@ -4813,8 +5269,14 @@ if __name__ == "__main__":
                         env_var='URI',
                         help="The URIs to open, can be used multiple times",
                         type=str,
-                        action='append',
-                        required=True)
+                        action='append')
+    parser.add_argument('--playlist',
+                        dest='playlist_name',
+                        env_var='PLAYLIST',
+                        help="A playlist named in playlists.toml, used when "
+                             "no --uri / URI is given",
+                        type=str,
+                        default="infinit")
     parser.add_argument('--stream-source',
                         dest='stream_source',
                         env_var='STREAM_SOURCE',
@@ -4902,9 +5364,9 @@ if __name__ == "__main__":
     parser.add_argument('--theme',
                         dest='theme_name',
                         env_var='THEME',
-                        help="The theme to use",
+                        help="The theme to use, a table in themes.toml",
                         type=str,
-                        default="default")
+                        default="infinit")
     parser.add_argument('--zeroconf-publish-service',
                         dest='zeroconf_publish_service',
                         env_var='ZEROCONF_PUBLISH',
@@ -4933,6 +5395,9 @@ if __name__ == "__main__":
         uris_list = [args.uris]
     else:
         uris_list = args.uris
+    if not uris_list:
+        uris_list = playlist_uris(args.playlist_name)
+        os.environ.setdefault("URI", "|".join(uris_list))
     if uris_list and isinstance(uris_list[0], str) and "|" in uris_list[0]:
         uris_list = uris_list[0].split("|")
     args.uris = uris_list
@@ -4951,6 +5416,7 @@ if __name__ == "__main__":
         args.mqtt_topics = []
 
     globals().update(vars(args))
+    apply_theme(args.theme_name)
     zc_service_name_prefix = args.zeroconf_service_name_prefix
     zc_service_type = args.zeroconf_service_type
     log_format = ('[%(asctime)s] {%(filename)s:%(lineno)d} '
@@ -5027,6 +5493,7 @@ if __name__ == "__main__":
     theme = Theme(theme_name)
     logging.info(f"PATH: {env.get('PATH', '')}")
     logging.info(f"Using theme: {theme_name}")
+    logging.info(f"Using playlist: {args.playlist_name}")
     logging.info(f"URIs: {uris}")
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
     for item in playlist.playlist:
@@ -5112,7 +5579,10 @@ if __name__ == "__main__":
 
         if web_server and web_server.poll() is None:
             logging.info(f"Stopping the web server, pid {web_server.pid}")
-            terminate_process(web_server, "web server")
+            try:
+                terminate_process(web_server, "web server")
+            except Exception as e:
+                logging.warning(f"Failed to stop the web server: {e}")
 
         try:
             stream_server.stop()
