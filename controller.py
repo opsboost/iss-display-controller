@@ -557,22 +557,33 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
                     refresh_interval_s=refresh_interval_s,
                     draw_function=draw_function)
 
+def text_top():
+    return round(display.res_y * 0.11)
+
+def text_space():
+    return display.res_y - text_top() - 40
+
+def text_height(text, font_size):
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+    layout = pangocairocffi.create_layout(cairo.Context(surface))
+    layout._set_width(pangocffi.units_from_double(display.res_x - 80))
+    font = theme.font or theme.font_face
+    layout.apply_markup(f'<span font="{font} {font_size}">{text}\n</span>')
+    _, extents = layout.get_extents()
+
+    return pangocffi.units_to_double(extents.height)
+
+def text_rows(font_size, header_lines=0):
+    line_px = (text_height("Xg\nXg", font_size)
+               - text_height("Xg", font_size))
+    rows = int(text_space() / line_px) - 1
+
+    return max(3, rows - header_lines)
+
 # A long table is shown whole rather than cut off: the rows are split into
 # pages that fit the view, the shown page advances on every refresh, and a
 # header line carries the position as 1/2, 2/2. The first line is the column
 # header and repeats on every page
-def text_rows(font_size, header_lines=0):
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
-    layout = pangocairocffi.create_layout(cairo.Context(surface))
-    font = theme.font or theme.font_face
-    layout.apply_markup(f'<span font="{font} {font_size}">Xg\nXg</span>')
-    _, extents = layout.get_extents()
-    line_px = pangocffi.units_to_double(extents.height) / 2
-    top = max(40, display.res_y / 2 - 300)
-    rows = int((display.res_y - top - 40) / line_px) - 1
-
-    return max(3, rows - header_lines)
-
 def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
                     method="python-wayland", font_size=14, page_lines=None,
                     split=False):
@@ -2358,11 +2369,18 @@ class Playlist:
 
     def start_log_view(self, img_bg, refresh_interval_s=5,
                        method="python-wayland", lines=10):
+        font_size = 16
+
         def log_texts():
-            return ["\n".join(ring_log.tail(lines)) or "No log yet"]
+            tail = ring_log.tail(lines)
+            while len(tail) > 1 and text_height(
+                    html.escape("\n".join(tail)), font_size) > text_space():
+                tail = tail[1:]
+
+            return ["\n".join(tail) or "No log yet"]
 
         draw(log_texts(), method=method, img_bg=img_bg,
-             font_sizes=[16], alignment="left", title="Log",
+             font_sizes=[font_size], alignment="left", title="Log",
              refresh=log_texts, refresh_interval_s=refresh_interval_s)
 
     # iss://prometheus/<endpoint>/<metric>[,<metric>...] -- fetch those metrics
@@ -3052,7 +3070,7 @@ class Wayland_view:
 
         s_object = {"alignment": "center",
                     "offset_x": 10,
-                    "offset_y": 10,
+                    "offset_y": text_top(),
                     "bg_alpha": 1,
                     "bg_colour_r": bg_r,
                     "bg_colour_g": bg_g,
