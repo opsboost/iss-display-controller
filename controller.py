@@ -85,15 +85,15 @@ draw_methods = ("python-wayland", "vju")
 
 
 metric_meta = {
-    "iss_display_build_info": ("gauge", "Build and dependency identity, always 1"),
+    "iss_display_build_info": ("gauge", "Always 1, carries build identity in its labels (python, deps_ref)"),
     "iss_display_start_time_seconds": ("gauge", "Unix time the display started"),
     "iss_display_host_uptime_seconds": ("gauge", "Seconds since the host booted"),
-    "iss_display_views_running": ("gauge", "View windows currently drawing"),
-    "iss_display_surface_commits_total": ("counter", "Surface commits submitted"),
-    "iss_display_frames_presented_total": ("counter", "Frames the compositor presented"),
+    "iss_display_views_running": ("gauge", "Live view windows, drawing or idle"),
+    "iss_display_surface_commits_total": ("counter", "Surface commits submitted, by view; the gap to frames_presented is what the compositor dropped or throttled"),
+    "iss_display_frames_presented_total": ("counter", "Frames the compositor actually presented, by view"),
     "iss_display_view_exits_total": ("counter", "View windows that stopped, by reason"),
     "iss_display_empty_views_total": ("counter", "Views drawn with no content, by player and item"),
-    "iss_display_window_switches_total": ("counter", "Focus switches performed"),
+    "iss_display_window_switches_total": ("counter", "Focus switches performed, by player and item"),
     "iss_display_item_shown_seconds_total": ("counter", "Seconds each item was on screen"),
     "iss_display_item_enabled": ("gauge", "Whether a playlist item is enabled"),
     "iss_display_item_play_time_seconds": ("gauge", "Configured play time per item"),
@@ -101,13 +101,14 @@ metric_meta = {
     "iss_display_sockets": ("gauge", "Live sockets (LISTEN, ESTABLISHED, connecting), by protocol and state"),
     "iss_display_sockets_transient": ("gauge", "Sockets in a closing or wait state (TIME_WAIT etc), by protocol and state"),
     "iss_display_sockets_total": ("gauge", "All sockets seen this scrape, live and transient"),
-    "iss_display_content_age_seconds": ("gauge", "Age of the content a view is showing"),
-    "iss_display_content_ticks_total": ("counter", "Refresh timer ticks handled"),
-    "iss_display_content_refreshes_total": ("counter", "Content refreshes that redrew"),
+    "iss_display_content_age_seconds": ("gauge", "Seconds since a view last redrew its content, by player and item; stays high while a poll keeps returning the same data"),
+    "iss_display_content_poll_age_seconds": ("gauge", "Seconds since a view last re-fetched its data, redrawn or not, by player and item; climbs without bound if the refresh loop stalls"),
+    "iss_display_content_ticks_total": ("counter", "Refresh timer ticks that came due, by player and item"),
+    "iss_display_content_refreshes_total": ("counter", "Ticks that found changed data and redrew, by player and item"),
     "iss_display_fetch_failures_total": ("counter", "Upstream fetches that failed, by source"),
-    "iss_display_rss_items": ("gauge", "Items parsed from an RSS feed"),
+    "iss_display_rss_items": ("gauge", "Items a feed view holds, by feed (RSS, Atom or Bluesky)"),
     "iss_display_swaymsg_errors_total": ("counter", "swaymsg calls that wrote to stderr"),
-    "iss_display_state_commands_total": ("counter", "State socket commands served"),
+    "iss_display_state_commands_total": ("counter", "State socket commands served, by command"),
     "iss_display_state_rate_limited_total": ("counter", "State socket datagrams the rate limiter refused, by scope"),
     "iss_display_state_rate_limited_clients": ("gauge", "Distinct source addresses the rate limiter has refused"),
     "iss_display_browser_up": ("gauge", "Whether a browser window is present"),
@@ -117,17 +118,18 @@ metric_meta = {
     "iss_display_stream_subscribers": ("gauge", "Clients connected to a stream, by stream type"),
     "iss_display_stream_snapshots_total": ("counter", "Snapshot stills served by the stream server"),
     "iss_display_http_requests_total": ("counter", "Requests handled, by route path"),
-    "iss_display_http_request_duration_seconds": ("summary", "Time spent handling requests"),
+    "iss_display_http_request_duration_seconds": ("summary", "Time spent handling requests, by route path (_sum and _count only, no quantiles)"),
     "iss_display_screenshot_failures_total": ("counter", "Screenshot captures that failed"),
-    "iss_display_process_cpu_seconds_total": ("counter", "CPU time used, by process name"),
-    "iss_display_thread_cpu_seconds_total": ("counter", "CPU time used, by process and thread name"),
-    "iss_display_process_resident_memory_bytes": ("gauge", "Resident memory held, by process name"),
-    "iss_display_process_threads": ("gauge", "Threads owned, by process name"),
-    "iss_display_processes": ("gauge", "Processes running, by process name"),
+    "iss_display_process_cpu_seconds_total": ("counter", "CPU time used, summed by process name (digits stripped, capped, see iss_display_process_names_dropped)"),
+    "iss_display_thread_cpu_seconds_total": ("counter", "CPU time used, by process and thread name (same name normalisation)"),
+    "iss_display_process_resident_memory_bytes": ("gauge", "Resident memory held, summed by process name (same name normalisation)"),
+    "iss_display_process_threads": ("gauge", "Threads owned, summed by process name (same name normalisation)"),
+    "iss_display_processes": ("gauge", "Processes running, counted by process name (digits stripped, capped, see iss_display_process_names_dropped)"),
+    "iss_display_process_names_dropped": ("gauge", "Distinct process names left out of the by-name process series because the 64-name cap was hit, 0 means those sums are complete"),
     "iss_display_container_cpu_seconds_total": ("counter", "CPU time the container cgroup used, by mode"),
     "iss_display_container_memory_bytes": ("gauge", "Container cgroup memory in use, by state"),
     "iss_display_container_memory_limit_bytes": ("gauge", "Container cgroup memory limit"),
-    "iss_display_container_tasks": ("gauge", "Tasks in the container cgroup"),
+    "iss_display_container_tasks": ("gauge", "Tasks in the container cgroup, threads included, so it exceeds sum(iss_display_processes) even before the name cap; this is the honest process+thread total"),
 }
 
 class Metrics:
@@ -252,12 +254,14 @@ class ProcessStats:
                             self.last_thread_seen, self.max_threads)
 
             tracked = set(self.cpu_seconds)
+            names_dropped = sum(1 for n in counts if n not in tracked)
 
             return (dict(self.cpu_seconds),
                     dict(self.thread_seconds),
                     {k: v for k, v in rss.items() if k in tracked},
                     {k: v for k, v in threads.items() if k in tracked},
-                    {k: v for k, v in counts.items() if k in tracked})
+                    {k: v for k, v in counts.items() if k in tracked},
+                    names_dropped)
 
     @classmethod
     def cgroup_value(cls, name):
@@ -286,6 +290,7 @@ process_stats = ProcessStats()
 live_views = []
 live_views_lock = threading.Lock()
 last_content_refresh = {}
+last_content_poll = {}
 last_content_refresh_lock = threading.Lock()
 content_refreshers = {}
 content_refreshers_lock = threading.Lock()
@@ -1564,11 +1569,11 @@ class Theme:
         self.highlight_colour = os.environ.get(
             "THEME_HIGHLIGHT_COLOUR", harmonious_accent(bg, fg))
 
-        path = "themes/" + self.name + "/background.jpg"
-        if os.path.exists(path):
-            self.img_bg = path
-        else:
-            self.img_bg = False
+        # Anchored to the module, not the cwd: the container runs
+        # controller.py from /, the way load_toml_table already resolves
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "themes", self.name, "background.jpg")
+        self.img_bg = path if os.path.isfile(path) else False
 
 class Playlist:
 
@@ -1861,13 +1866,14 @@ class Playlist:
 
         return threads
 
-    # An item has two times: play_time_s is how long the view is shown
-    # (the t= param), refresh_s how often its content is fetched again
-    # (the refresh= param). Unless a uri says otherwise, content refreshes
-    # once per showing
+    # An item has two times: play_time_s is how long the view is shown (the
+    # t= param), refresh_s how often its content is fetched again (the
+    # refresh= param). Content refreshes once per showing by default; a
+    # refresh= only slows that down, never below the presentation time, so a
+    # poll never runs more often than the view is on screen
     @staticmethod
     def item_refresh_s(item):
-        return item.get("refresh_s") or item["play_time_s"]
+        return max(item.get("refresh_s") or 0, item["play_time_s"])
 
     def refresh_args(self, item):
         return (self.theme.img_bg,
@@ -2657,7 +2663,7 @@ class Playlist:
         draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
                        refresh_interval_s, overlays=2, source="bluesky",
                        draw_function=view.draw_text_and_image,
-                       alignments={2: "justify"})
+                       alignments={2: "left"})
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
@@ -2965,6 +2971,9 @@ class Content_refresh:
             metrics.inc("iss_display_fetch_failures_total", source=self.source)
             return
 
+        with last_content_refresh_lock:
+            last_content_poll[(self.source, self.num)] = time.time()
+
         if not texts or texts == self.last_texts:
             return
 
@@ -3188,13 +3197,11 @@ class Wayland_view:
                 logging.debug(f"view: s_objects[{idx}] file {obj['file']}")
 
         if draw_function is None:
-            use_images = bool(img_bg) or bool(self.s_objects[0].get("file"))
-            if use_images:
-                if img_bg:
-                    self.s_objects[0]["file"] = img_bg
-                draw_function = view.draw_images_with_text
-            else:
-                draw_function = view.draw_text
+            # A background image is object 0's file; draw_text paints it
+            # cover-scaled and lays the text out over it
+            if img_bg:
+                self.s_objects[0]["file"] = img_bg
+            draw_function = view.draw_text
 
         w = view.Window(self.conn,
                         self.window,
@@ -4088,11 +4095,16 @@ class Display:
                         getattr(window, "frames", 0), view=title)
 
         metrics.clear_gauge("iss_display_content_age_seconds")
+        metrics.clear_gauge("iss_display_content_poll_age_seconds")
         now = time.time()
         with last_content_refresh_lock:
             ages = {k: now - v for k, v in last_content_refresh.items()}
+            poll_ages = {k: now - v for k, v in last_content_poll.items()}
         for (source, num), age in ages.items():
             metrics.set("iss_display_content_age_seconds", age,
+                        player=source, num=num)
+        for (source, num), age in poll_ages.items():
+            metrics.set("iss_display_content_poll_age_seconds", age,
                         player=source, num=num)
 
         metrics.clear_gauge("iss_display_item_enabled")
@@ -4115,11 +4127,13 @@ class Display:
                      "iss_display_process_resident_memory_bytes",
                      "iss_display_process_threads",
                      "iss_display_processes",
+                     "iss_display_process_names_dropped",
                      "iss_display_container_cpu_seconds_total",
                      "iss_display_container_memory_bytes"):
             metrics.clear_gauge(name)
 
-        cpu, thread_cpu, rss, threads, counts = process_stats.sample()
+        cpu, thread_cpu, rss, threads, counts, names_dropped = process_stats.sample()
+        metrics.set("iss_display_process_names_dropped", names_dropped)
         for (process, thread), seconds in thread_cpu.items():
             metrics.set("iss_display_thread_cpu_seconds_total", seconds,
                         process=process, thread=thread)
@@ -5622,7 +5636,10 @@ if __name__ == "__main__":
     web_server = None
     stopping = threading.Event()
     stopping_since = 0.0
-    force_exit_after_s = 2
+    # A normal shutdown (scream, sway, the browser and media player) takes a
+    # few seconds; within this window a second, impatient Ctrl-C is ignored
+    # so the graceful path still finishes and exits 0
+    force_exit_after_s = 8
 
     # Set up signal handler
     def signal_handler(number, *args):
@@ -5632,7 +5649,9 @@ if __name__ == "__main__":
                 return
 
             logging.warning(f"Signal {number} while already stopping, exiting now")
-            os._exit(1)
+            # A stop that was asked for, even a stuck one, is not a crash:
+            # exit 0 so a tmux pane with remain-on-exit=failed still closes
+            os._exit(0)
 
         globals()['stopping_since'] = time.time()
         stopping.set()
