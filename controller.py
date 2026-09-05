@@ -530,7 +530,8 @@ def gst_has(element):
 # placeholder for an empty one. A source with nothing on the first fetch is
 # not shown at all unless OMIT_NO_DATA_VIEWS says otherwise
 def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
-                   overlays=1, source="", draw_function=None):
+                   overlays=1, source="", draw_function=None,
+                   alignments=None):
     first = fetch()
     if not first and omit_no_data_views():
         logging.warning(f"view: No data from {source or 'the source'}, "
@@ -541,6 +542,8 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
                       len(font_sizes) + overlays, theme)
     for n, size in enumerate(font_sizes):
         wv.s_objects[n]["font_size"] = size
+    for n, alignment in (alignments or {}).items():
+        wv.s_objects[n]["alignment"] = alignment
 
     unfetched = object()
 
@@ -2641,11 +2644,8 @@ class Playlist:
 
             name = item.get("feed", "")
             handle = item.get("handle", "")
-            rank = item.get("rank")
             header = f"{name}  @{handle}" if name and name != handle \
                 else f"@{handle}"
-            if rank:
-                header += f"  #{rank}"
             text = item.get("text") or item.get("title", "")
             link = item.get("link") or item.get("url", "")
 
@@ -2656,7 +2656,8 @@ class Playlist:
 
         draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
                        refresh_interval_s, overlays=2, source="bluesky",
-                       draw_function=view.draw_text_and_image)
+                       draw_function=view.draw_text_and_image,
+                       alignments={2: "justify"})
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
