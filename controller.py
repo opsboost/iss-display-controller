@@ -15,6 +15,8 @@ import json
 import logging
 import math
 import os
+import pangocairocffi
+import pangocffi
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 import platform
@@ -353,6 +355,13 @@ def kv_table(rows):
 
     return "\n".join(lines)
 
+# A blank line between a table's column header and its rows, so the header
+# reads as a header rather than the first row
+def header_gap(text):
+    head, sep, rest = text.partition("\n")
+
+    return f"{head}\n\n{rest}" if sep and rest.strip() else text
+
 # A prometheus value is a float; show a whole number without the .0
 def fmt_number(v):
     return str(int(v)) if float(v).is_integer() else f"{v:g}"
@@ -521,7 +530,7 @@ def gst_has(element):
 # placeholder for an empty one. A source with nothing on the first fetch is
 # not shown at all unless OMIT_NO_DATA_VIEWS says otherwise
 def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
-                   overlays=1, source=""):
+                   overlays=1, source="", draw_function=None):
     first = fetch()
     if not first and omit_no_data_views():
         logging.warning(f"view: No data from {source or 'the source'}, "
@@ -545,44 +554,66 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
     wv.show_content(refresh(first), img_bg,
                     refresh_when_hidden=True,
                     refresh=refresh,
-                    refresh_interval_s=refresh_interval_s)
+                    refresh_interval_s=refresh_interval_s,
+                    draw_function=draw_function)
 
 # A long table is shown whole rather than cut off: the rows are split into
 # pages that fit the view, the shown page advances on every refresh, and a
 # header line carries the position as 1/2, 2/2. The first line is the column
 # header and repeats on every page
+def text_rows(font_size, header_lines=0):
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+    layout = pangocairocffi.create_layout(cairo.Context(surface))
+    font = theme.font or theme.font_face
+    layout.apply_markup(f'<span font="{font} {font_size}">Xg\nXg</span>')
+    _, extents = layout.get_extents()
+    line_px = pangocffi.units_to_double(extents.height) / 2
+    top = max(40, display.res_y / 2 - 300)
+    rows = int((display.res_y - top - 40) / line_px) - 1
+
+    return max(3, rows - header_lines)
+
 def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
-                    method="python-wayland", font_size=14, page_lines=24,
+                    method="python-wayland", font_size=14, page_lines=None,
                     split=False):
     state = {"page": 0}
+    page_lines = page_lines or text_rows(font_size, 4)
 
     # A monospace glyph is about 0.8px per point wide and the layout keeps a
     # 40px margin on each side. A row past that width is clipped rather than
-    # wrapped, since a wrapped tail starts under the first column and breaks
-    # the table. split=True instead drops the overflow to one indented
-    # continuation line, broken on a space, and clips that
+    # wrapped, since a plain wrapped tail starts back at column 0 and breaks
+    # the table. split=True instead drops the overflow to one continuation
+    # line, broken on a space and aligned under the last column, then clips it
     max_chars = max(20, int((display.res_x - 80) / (font_size * 0.8)))
 
-    def fit(line):
+    def last_column_indent(header):
+        m = re.search(r"\S+\s*$", header)
+        start = m.start() if m else 0
+
+        return min(start, max_chars * 2 // 3)
+
+    def fit(line, cont=0):
         if len(line) <= max_chars:
             return [line]
         if not split:
             return [line[:max_chars - 1] + "…"]
-        cut = line.rfind(" ", 8, max_chars)
-        if cut <= max_chars // 2:
+        cut = line.rfind(" ", cont or 8, max_chars)
+        if cut <= cont:
             cut = max_chars
         tail = line[cut:].strip()
-        if len(tail) > max_chars - 4:
-            tail = tail[:max_chars - 5] + "…"
-        return [line[:cut].rstrip(), "    " + tail]
+        room = max_chars - cont - 1
+        if len(tail) > room:
+            tail = tail[:room - 1] + "…"
+        return [line[:cut].rstrip(), " " * cont + tail]
 
     def texts():
         lines = lines_fn()
         if not lines:
             return [f"No {title.lower()} data"]
 
+        cont = last_column_indent(lines[0]) if split else 0
         head = fit(lines[0])[0]
-        blocks = [fit(row) for row in lines[1:]]
+        blocks = [fit(row, cont) for row in lines[1:]]
         pages, cur = [], []
         for block in blocks:
             if cur and len(cur) + len(block) > page_lines:
@@ -596,7 +627,7 @@ def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
         state["page"] = page + 1
         counter = "" if len(pages) == 1 else f" {page + 1}/{len(pages)}"
 
-        return ["\n".join([f"{title}{counter} ({len(blocks)})", "", head]
+        return ["\n".join([f"{title}{counter} ({len(blocks)})", "", head, ""]
                           + pages[page])]
 
     draw(texts(), method=method, img_bg=img_bg, font_sizes=[font_size],
@@ -1315,7 +1346,7 @@ def draw_sizes(kind, path=None):
     wv = Wayland_view(display.res_x, display.res_y, 1, theme)
     wv.s_objects[0]["font_size"] = 18
     wv.s_objects[0]["alignment"] = "left"
-    wv.show_content([text])
+    wv.show_content([header_gap(text)])
 
 # iss://art/<source>; the bare iss://art keeps working and means ngoa
 art_sources = {"ngoa": ArtNGA, "mmoa": ArtMet}
@@ -1349,8 +1380,11 @@ def draw_art(source=None):
 def draw_calendar():
     """
     Draws a calendar for the current month, highlighting the current day and
-    day name, with the next bank holidays underneath.
+    day name, with a big day-of-month numeral to the right of the grid, sized
+    to the grid's own height, and the next bank holidays underneath.
     """
+    import datetime
+
     # The month lines come from doi; the pango markup for the highlights is
     # ours, since it belongs to this renderer. Colours come from the theme
     accent = theme.highlight_colour
@@ -1373,17 +1407,23 @@ def draw_calendar():
         lines = ["Calendar view needs a newer doi"]
         holidays = []
 
-    texts = ["\n".join(lines)]
+    texts = ["\n".join(lines), str(datetime.date.today().day)]
     if holidays:
         texts.append("\n".join(holidays))
 
     wv = Wayland_view(display.res_x, display.res_y, len(texts), theme)
     wv.s_objects[0]["font_size"] = 20
     wv.s_objects[0]["alignment"] = "left"
-    if len(texts) > 1:
-        wv.s_objects[1]["font_size"] = 16
-        wv.s_objects[1]["alignment"] = "left"
-    wv.show_content(texts, html_escape=False)
+    accent_rgb = parse_colour(accent)
+    if accent_rgb:
+        (wv.s_objects[1]["font_colour_r"], wv.s_objects[1]["font_colour_g"],
+         wv.s_objects[1]["font_colour_b"]) = accent_rgb
+    wv.s_objects[1]["scale"] = 1.5
+    wv.s_objects[1]["gap"] = 100
+    if len(texts) > 2:
+        wv.s_objects[2]["font_size"] = 16
+        wv.s_objects[2]["alignment"] = "left"
+    wv.show_content(texts, html_escape=False, draw_function=view.draw_scaled_pair)
 
 
 class Zeroconf_service:
@@ -2310,7 +2350,7 @@ class Playlist:
     def start_top_view(self, img_bg, refresh_interval_s=5,
                        method="python-wayland"):
         def top_texts():
-            return [System.top(20) or "No process data"]
+            return [header_gap(System.top(20) or "No process data")]
 
         draw(top_texts(), method=method, img_bg=img_bg,
              font_sizes=[20], alignment="left", title="Top",
@@ -2356,7 +2396,7 @@ class Playlist:
                             method="python-wayland"):
         font_size = 20
         cols = max(48, int((display.res_x - 80) / (font_size * 0.8)))
-        page_lines = max(6, int((display.res_y - 120) / (font_size * 1.6)))
+        page_lines = text_rows(font_size, 2)
         state = {"page": 0}
 
         def entry_blocks():
@@ -2591,13 +2631,14 @@ class Playlist:
             text = item.get("text") or item.get("title", "")
             link = item.get("link") or item.get("url", "")
 
-            # A post's picture, when it has one, alongside the qr; both are
-            # overlays draw_overlays scales and places bottom-right
+            # The qr is a small corner overlay; the post's picture, when it
+            # has one, is the last file and gets the full-height side column
             return ([header, "", text, "", link],
                     [wv.qr(link), item.get("image", "")])
 
         draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
-                       refresh_interval_s, overlays=2, source="bluesky")
+                       refresh_interval_s, overlays=2, source="bluesky",
+                       draw_function=view.draw_text_and_image)
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
@@ -2928,6 +2969,27 @@ def wayland_protocol(*paths):
 
     return None
 
+# The playlist-position dots along a view's bottom edge. python-wayland only
+# calls after_draw(w, ctx) once its own content is painted and has no
+# opinion on what that draws
+def draw_view_indicator(count, num, rgb, w, ctx):
+    if not count or num is None:
+        return
+
+    radius, spacing, margin = 7, 28, 24
+    ctx.identity_matrix()
+    ctx.set_line_width(2)
+    ctx.set_source_rgba(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, 0.8)
+    x = (w.orig_width - (count - 1) * spacing) / 2
+    y = w.orig_height - margin
+    for n in range(count):
+        ctx.new_path()
+        ctx.arc(x + n * spacing, y, radius, 0, 2 * math.pi)
+        if n == num:
+            ctx.fill()
+        else:
+            ctx.stroke()
+
 
 class Wayland_view:
 
@@ -2969,13 +3031,13 @@ class Wayland_view:
 
         if item and view_indicator():
             items = get_playlist_items()
-            self.window["view_count"] = len(items)
-            self.window["view_num"] = next(
-                (i for i, it in enumerate(items)
-                 if it.get("num") == item["num"]), None)
-            self.window["view_indicator_rgb"] = (
-                parse_colour(theme.view_indicator_colour)
-                or parse_colour(Theme.default_font_colour))
+            count = len(items)
+            num = next((i for i, it in enumerate(items)
+                       if it.get("num") == item["num"]), None)
+            rgb = (parse_colour(theme.view_indicator_colour)
+                  or parse_colour(Theme.default_font_colour))
+            self.window["after_draw"] = partial(draw_view_indicator,
+                                                count, num, rgb)
 
         # The theme sets the view background and text colours; a per-item
         # bg_colour from the web ui overrides the background
@@ -3096,7 +3158,7 @@ class Wayland_view:
 
     def show_content(self, texts, img_bg=False, fullscreen=False, html_escape=True,
                      refresh=None, refresh_interval_s=None,
-                     refresh_when_hidden=False):
+                     refresh_when_hidden=False, draw_function=None):
         logging.debug(f"view: Have {len(texts)} text block(s)")
 
         self.set_texts(texts, html_escape)
@@ -3106,13 +3168,14 @@ class Wayland_view:
             if obj.get("file"):
                 logging.debug(f"view: s_objects[{idx}] file {obj['file']}")
 
-        use_images = bool(img_bg) or bool(self.s_objects[0].get("file"))
-        if use_images:
-            if img_bg:
-                self.s_objects[0]["file"] = img_bg
-            draw_function = view.draw_images_with_text
-        else:
-            draw_function = view.draw_text
+        if draw_function is None:
+            use_images = bool(img_bg) or bool(self.s_objects[0].get("file"))
+            if use_images:
+                if img_bg:
+                    self.s_objects[0]["file"] = img_bg
+                draw_function = view.draw_images_with_text
+            else:
+                draw_function = view.draw_text
 
         w = view.Window(self.conn,
                         self.window,
