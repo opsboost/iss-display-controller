@@ -536,7 +536,7 @@ def gst_has(element):
 # not shown at all unless OMIT_NO_DATA_VIEWS says otherwise
 def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
                    overlays=1, source="", draw_function=None,
-                   alignments=None):
+                   alignments=None, grid=None):
     first = fetch()
     if not first and omit_no_data_views():
         logging.warning(f"view: No data from {source or 'the source'}, "
@@ -549,6 +549,8 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
         wv.s_objects[n]["font_size"] = size
     for n, alignment in (alignments or {}).items():
         wv.s_objects[n]["alignment"] = alignment
+    if grid:
+        wv.window["grid"] = grid
 
     unfetched = object()
 
@@ -2646,7 +2648,7 @@ class Playlist:
 
         def render(wv, item):
             if not item:
-                return [f"@{bsky.actor}", "", "No posts", "", ""], [""]
+                return [f"@{bsky.actor}", "", "No posts", "", ""], ["", ""]
 
             name = item.get("feed", "")
             handle = item.get("handle", "")
@@ -2655,15 +2657,23 @@ class Playlist:
             text = item.get("text") or item.get("title", "")
             link = item.get("link") or item.get("url", "")
 
-            # The qr is a small corner overlay; the post's picture, when it
-            # has one, is the last file and gets the full-height side column
+            # slot 5 is the qr corner overlay, slot 6 the post picture when it
+            # has one, which the grid gives the full-height side column
             return ([header, "", text, "", link],
                     [wv.qr(link), item.get("image", "")])
 
         draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
                        refresh_interval_s, overlays=2, source="bluesky",
-                       draw_function=view.draw_text_and_image,
-                       alignments={2: "left"})
+                       draw_function=view.draw_grid,
+                       alignments={2: "left"},
+                       grid={"cols": ["1fr", "auto"],
+                             "rows": ["auto", "1fr", "auto"],
+                             "cells": [{"slot": 0, "col": 0, "row": 0},
+                                       {"slot": 2, "col": 0, "row": 1,
+                                        "valign": "start"},
+                                       {"slot": 4, "col": 0, "row": 2},
+                                       {"slot": 6, "col": 1, "row": 0,
+                                        "rowspan": 3, "fit": "contain"}]})
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
