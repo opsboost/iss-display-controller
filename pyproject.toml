@@ -12,6 +12,7 @@ dependencies = [
     "cairocffi>=1.7.1",
     "configargparse>=1.7.1",
     "git+https://github.com/bbusse/doi@dev#egg=doi",
+    "git+https://github.com/bbusse/qr-code-service@dev#egg=qr_code_service",
     "starlette>=0.38.0",
     "requests>=2.32.5",
     "pangocffi>=0.13.0",
