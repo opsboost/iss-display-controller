@@ -6,9 +6,12 @@ import functools
 from functools import partial
 import cairocffi as cairo
 import configargparse
-from doi import (APOD, Art, ArtMet, ArtNGA, Bluesky, Calendar, MQTT, Music,
-                 News, OTD, PrometheusClient, RSSFeed, System, Weather)
-from qr_code_service import encode as encode_qr, QREncodeError
+import datetime
+from doi import (APOD, ArtMet, ArtNGA, Bluesky, Calendar, MQTT, Music, News,
+                 OTD, PrometheusClient, RSSFeed, System, Weather)
+from doi.cache import cache
+from qr_code_service import encode_png, QREncodeError
+import render
 import html
 import ipaddress
 import json
@@ -17,13 +20,11 @@ import math
 import os
 import pangocairocffi
 import pangocffi
-from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 import platform
 import re
 import secrets
 import socket
-import stat
 import subprocess
 from subprocess import Popen
 import shlex
@@ -43,8 +44,15 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 from wayland import draw as view
 import wayland.protocol
 
-# Suppress protocol.py INFO messages
 logging.getLogger("wayland.protocol").setLevel(logging.WARNING)
+
+
+def log_thread_exception(args):
+    logging.error(f"{args.thread.name}: uncaught exception",
+                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+threading.excepthook = log_thread_exception
 
 
 # Keeps the last N formatted log lines in memory so a view can tail the
@@ -67,10 +75,9 @@ class RingLog(logging.Handler):
 ring_log = RingLog()
 
 
-# Ensure child processes inherit the runtime environment (including PATH)
 env = os.environ.copy()
 
-stream_sources = ["static-images", "v4l2", "vnc-browser", "mosaic"]
+stream_sources = ("vnc-browser", "mosaic")
 cmds = {"clock":        "humanbeans_clock",
         "media_player": "gst-launch-1.0",
         "servo":        "servo",
@@ -123,11 +130,12 @@ metric_meta = {
     "iss_display_process_cpu_seconds_total": ("counter", "CPU time used, summed by process name (digits stripped, capped, see iss_display_process_names_dropped)"),
     "iss_display_thread_cpu_seconds_total": ("counter", "CPU time used, by process and thread name (same name normalisation)"),
     "iss_display_process_resident_memory_bytes": ("gauge", "Resident memory held, summed by process name (same name normalisation)"),
+    "iss_display_process_resident_memory_peak_bytes": ("gauge", "Each process's own resident memory high water mark (VmHWM), summed by process name, so a spike between scrapes is not lost"),
     "iss_display_process_threads": ("gauge", "Threads owned, summed by process name (same name normalisation)"),
     "iss_display_processes": ("gauge", "Processes running, counted by process name (digits stripped, capped, see iss_display_process_names_dropped)"),
     "iss_display_process_names_dropped": ("gauge", "Distinct process names left out of the by-name process series because the 64-name cap was hit, 0 means those sums are complete"),
     "iss_display_container_cpu_seconds_total": ("counter", "CPU time the container cgroup used, by mode"),
-    "iss_display_container_memory_bytes": ("gauge", "Container cgroup memory in use, by state"),
+    "iss_display_container_memory_bytes": ("gauge", "Container cgroup memory in use, by state: current and peak, and the current split into anon (process heaps), file (page cache) and shmem (tmpfs)"),
     "iss_display_container_memory_limit_bytes": ("gauge", "Container cgroup memory limit"),
     "iss_display_container_tasks": ("gauge", "Tasks in the container cgroup, threads included, so it exceeds sum(iss_display_processes) even before the name cap; this is the honest process+thread total"),
 }
@@ -161,14 +169,6 @@ class Metrics:
             return {"counters": [[k[0], list(k[1]), v] for k, v in self.counters.items()],
                     "gauges": [[k[0], list(k[1]), v] for k, v in self.gauges.items()]}
 
-    def merge(self, snapshot):
-        for name, labels, value in (snapshot or {}).get("counters", []):
-            with self.lock:
-                self.counters[(name, tuple(tuple(l) for l in labels))] += value
-        for name, labels, value in (snapshot or {}).get("gauges", []):
-            with self.lock:
-                self.gauges[(name, tuple(tuple(l) for l in labels))] = value
-
 class ProcessStats:
 
     max_names = 64
@@ -185,22 +185,24 @@ class ProcessStats:
         self.ticks = os.sysconf('SC_CLK_TCK')
 
     # The per-process numbers come from doi's parser, the one stat reader both
-    # projects share; only the per-thread walk stays local
+    # projects share. Only the per-thread walk stays local
     def read_proc(self):
         live = {}
         live_threads = {}
         rss = collections.defaultdict(int)
+        rss_peak = collections.defaultdict(int)
         threads = collections.defaultdict(int)
         counts = collections.defaultdict(int)
         for proc in System.process_cpu_times():
             name = proc["name"]
             live[(proc["pid"], proc["starttime"])] = (name, proc["cpu_s"])
             rss[name] += proc["rss_b"]
+            rss_peak[name] += proc["rss_peak_b"]
             threads[name] += proc["threads"]
             counts[name] += 1
             live_threads.update(self.read_tasks(str(proc["pid"]), name))
 
-        return live, live_threads, rss, threads, counts
+        return live, live_threads, rss, rss_peak, threads, counts
 
     def read_tasks(self, entry, process):
         tasks = {}
@@ -246,7 +248,7 @@ class ProcessStats:
             del last_seen[key]
 
     def sample(self):
-        live, live_threads, rss, threads, counts = self.read_proc()
+        live, live_threads, rss, rss_peak, threads, counts = self.read_proc()
         with self.lock:
             self.accumulate(self.cpu_seconds, live,
                             self.last_seen, self.max_names)
@@ -259,6 +261,7 @@ class ProcessStats:
             return (dict(self.cpu_seconds),
                     dict(self.thread_seconds),
                     {k: v for k, v in rss.items() if k in tracked},
+                    {k: v for k, v in rss_peak.items() if k in tracked},
                     {k: v for k, v in threads.items() if k in tracked},
                     {k: v for k, v in counts.items() if k in tracked},
                     names_dropped)
@@ -270,6 +273,20 @@ class ProcessStats:
                 return int(f.read().strip())
         except (OSError, ValueError):
             return None
+
+    @classmethod
+    def cgroup_memory(cls):
+        usage = {}
+        try:
+            with open(f"{cls.cgroup_root}/memory.stat", encoding='utf-8') as f:
+                for line in f:
+                    key, _, value = line.partition(' ')
+                    if key in ("anon", "file", "shmem"):
+                        usage[key] = int(value)
+        except (OSError, ValueError):
+            pass
+
+        return usage
 
     @classmethod
     def cgroup_cpu(cls):
@@ -296,10 +313,15 @@ content_refreshers = {}
 content_refreshers_lock = threading.Lock()
 
 
+def content_refresher(num):
+    with content_refreshers_lock:
+        return content_refreshers.get(str(num))
+
+
 def playlist_item():
     return getattr(threading.current_thread(), "playlist_item", None)
 
-# A playlist item holds a live fetcher under one of these keys; drop them
+# A playlist item holds a live fetcher under one of these keys. Drop them
 # before the item is sent as json
 item_fetcher_keys = ("news", "bluesky")
 
@@ -339,10 +361,10 @@ def harmonious_accent(bg_rgb, font_rgb):
     font_l = colorsys.rgb_to_hls(*(c / 255 for c in font_rgb))[1]
     h = (h + 0.5) % 1.0
     s = 0.65 if s < 0.15 else max(0.5, min(0.8, s))
-    l = 0.6 if font_l >= 0.5 else 0.42
+    light = 0.6 if font_l >= 0.5 else 0.42
 
     return hex_colour(tuple(round(c * 255)
-                            for c in colorsys.hls_to_rgb(h, l, s)))
+                            for c in colorsys.hls_to_rgb(h, light, s)))
 
 # A monospace two-column block, key left and value right, the shape the status
 # views share. Blank values are dropped and a multi-line value keeps its extra
@@ -367,7 +389,7 @@ def header_gap(text):
 
     return f"{head}\n\n{rest}" if sep and rest.strip() else text
 
-# A prometheus value is a float; show a whole number without the .0
+# A prometheus value is a float, so show a whole number without the .0
 def fmt_number(v):
     return str(int(v)) if float(v).is_integer() else f"{v:g}"
 
@@ -381,11 +403,10 @@ def udp_family(host):
 def host_port(host, port):
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
+# Every address the web server answers on. A specific bind returns itself, a
+# wildcard bind (0.0.0.0, ::, unset) expands to its loopback plus each
+# interface address from System.net_addresses()
 def listen_endpoints(bind_address, port):
-    """Every address the web server answers on. A specific bind returns
-    itself. A wildcard bind (0.0.0.0, ::, unset) expands to its loopback
-    plus each interface address from System.net_addresses().
-    """
     wildcard_loopback = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}
     host = (bind_address or "").strip("[]")
     if host not in wildcard_loopback:
@@ -393,8 +414,7 @@ def listen_endpoints(bind_address, port):
 
     endpoints, seen = [], set()
     for addr in [wildcard_loopback[host]] + [
-            line.split()[1] for line in
-            (System.net_addresses() or "").splitlines() if len(line.split()) >= 2]:
+            row["ip"] for row in System.net_addresses()]:
         addr = addr.split("%", 1)[0]  # if_inet6 zone id
         if addr and addr not in seen:
             seen.add(addr)
@@ -414,12 +434,10 @@ def terminate_process(proc, name, timeout_s=5):
         except subprocess.TimeoutExpired:
             logging.warning(f"{name}: Still running after kill, leaving it to the kernel")
 
+# A long-running child with the shared defaults: the controller's environment,
+# closed inherited fds, and its own session so a signal to the controller's
+# process group leaves it alone. Keyword args override each default
 def spawn(cmd, **kwargs):
-    """Start a long-running child with the shared defaults: the controller's
-    environment, closed inherited fds, and its own session so a signal to the
-    controller's process group leaves it alone. Children are torn down by
-    name through terminate_process. Keyword args override each default.
-    """
     kwargs.setdefault("env", env)
     kwargs.setdefault("start_new_session", True)
     kwargs.setdefault("close_fds", True)
@@ -446,7 +464,7 @@ def render_metrics(*sources):
         for kind in ("counters", "gauges"):
             for name, labels, value in (source or {}).get(kind, []):
                 families[metric_family(name)].append(
-                    (name, tuple(tuple(l) for l in labels), value))
+                    (name, tuple(map(tuple, labels)), value))
 
     lines = []
     for family in sorted(families):
@@ -473,7 +491,7 @@ def draw(texts, method="python-wayland", **options):
 
 def draw_python(texts, img_bg=False, font_sizes=None, alignment=None,
                 title=None, refresh=None, refresh_interval_s=None,
-                html_escape=True, args=None):
+                html_escape=True, args=None, pager=None):
     wv = Wayland_view(display.res_x, display.res_y, max(len(texts), 1), theme)
     for n in range(len(wv.s_objects)):
         if font_sizes:
@@ -484,7 +502,7 @@ def draw_python(texts, img_bg=False, font_sizes=None, alignment=None,
     return wv.show_content(texts, img_bg,
                            refresh=refresh,
                            refresh_interval_s=refresh_interval_s,
-                           html_escape=html_escape)
+                           html_escape=html_escape, pager=pager)
 
 def omit_no_data_views():
     return env_bool("OMIT_NO_DATA_VIEWS", True)
@@ -499,7 +517,7 @@ def show_qr_code():
 
 # Picture in picture. A double bar splits the playlist into a pinned view and
 # a cycling set: "pinned||a|b|c" pins the first view full size and cycles the
-# rest in the corner; "a|b|c||pinned" cycles a, b, c full size and pins the
+# rest in the corner. "a|b|c||pinned" cycles a, b, c full size and pins the
 # last view in the corner. The corner window is this fraction of the output
 def pip_scale():
     try:
@@ -530,13 +548,13 @@ def gst_has(element):
 
 # The item views share one shape: a column of text lines with fixed font
 # sizes and overlay images bottom right. fetch returns the source's current
-# item and runs again on every refresh, so what is shown stays current;
+# item and runs again on every refresh, so what is shown stays current.
 # render(view, item) turns an item into (texts, overlay files) and shows a
 # placeholder for an empty one. A source with nothing on the first fetch is
 # not shown at all unless OMIT_NO_DATA_VIEWS says otherwise
 def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
                    overlays=1, source="", draw_function=None,
-                   alignments=None):
+                   alignments=None, grid=None):
     first = fetch()
     if not first and omit_no_data_views():
         logging.warning(f"view: No data from {source or 'the source'}, "
@@ -549,6 +567,8 @@ def draw_item_view(fetch, render, font_sizes, img_bg, refresh_interval_s,
         wv.s_objects[n]["font_size"] = size
     for n, alignment in (alignments or {}).items():
         wv.s_objects[n]["alignment"] = alignment
+    if grid:
+        wv.window["grid"] = grid
 
     unfetched = object()
 
@@ -588,15 +608,44 @@ def text_rows(font_size, header_lines=0):
 
     return max(3, rows - header_lines)
 
-# A long table is shown whole rather than cut off: the rows are split into
-# pages that fit the view, the shown page advances on every refresh, and a
+# Rows split into pages that each fit the view. The rotation shows a paged
+# view page by page, each for the item's play time, and steps the page from
+# there. The view's own refresh timer only re-renders the current page with
+# fresh rows
+class Pager:
+
+    def __init__(self, page_lines):
+        self.page_lines = page_lines
+        self.page = 0
+        self.count = 1
+
+    # The rows of the current page and its position as " 1/2", "" for one page
+    def paginate(self, blocks):
+        pages, cur = [], []
+        for block in blocks:
+            if cur and len(cur) + len(block) > self.page_lines:
+                pages.append(cur)
+                cur = []
+            cur.extend(block)
+        if cur:
+            pages.append(cur)
+        pages = pages or [[]]
+        self.count = len(pages)
+        self.page %= self.count
+        counter = "" if self.count == 1 else f" {self.page + 1}/{self.count}"
+
+        return pages[self.page], counter
+
+    def step(self):
+        self.page = (self.page + 1) % self.count
+
+# A long table is shown whole rather than cut off: the rows are paged, and a
 # header line carries the position as 1/2, 2/2. The first line is the column
 # header and repeats on every page
 def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
                     method="python-wayland", font_size=14, page_lines=None,
                     split=False):
-    state = {"page": 0}
-    page_lines = page_lines or text_rows(font_size, 4)
+    pager = Pager(page_lines or text_rows(font_size, 4))
 
     # A monospace glyph is about 0.8px per point wide and the layout keeps a
     # 40px margin on each side. A row past that width is clipped rather than
@@ -633,31 +682,20 @@ def draw_paged_view(title, lines_fn, img_bg, refresh_interval_s=5,
         cont = last_column_indent(lines[0]) if split else 0
         head = fit(lines[0])[0]
         blocks = [fit(row, cont) for row in lines[1:]]
-        pages, cur = [], []
-        for block in blocks:
-            if cur and len(cur) + len(block) > page_lines:
-                pages.append(cur)
-                cur = []
-            cur.extend(block)
-        if cur:
-            pages.append(cur)
-        pages = pages or [[]]
-        page = state["page"] % len(pages)
-        state["page"] = page + 1
-        counter = "" if len(pages) == 1 else f" {page + 1}/{len(pages)}"
+        rows, counter = pager.paginate(blocks)
 
         return ["\n".join([f"{title}{counter} ({len(blocks)})", "", head, ""]
-                          + pages[page])]
+                          + rows)]
 
     draw(texts(), method=method, img_bg=img_bg, font_sizes=[font_size],
-         alignment="left", title=title,
+         alignment="left", title=title, pager=pager,
          refresh=texts, refresh_interval_s=refresh_interval_s)
 
 # vju reads what it shows from stdin and keeps its window for as long as it
 # runs, so a refresh is a fresh process rather than a repaint
 def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
              title=None, refresh=None, refresh_interval_s=None,
-             args=None, **_):
+             args=None, pager=None, **_):
     scale = pip_scale() if pip_corner(playlist_item()) else 1
 
     def render(content):
@@ -685,7 +723,7 @@ def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
         # own window, so it is left to run rather than fed on stdin
         watching = "--watch" in cmd
         logging.info(f"vju: {' '.join(cmd)}")
-        proc = Popen(cmd, env=env, shell=False, close_fds=True,
+        proc = Popen(cmd, env=env,
                      stdin=None if watching else subprocess.PIPE,
                      encoding="utf8")
         try:
@@ -710,6 +748,8 @@ def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
             logging.warning(f"vju: Exited with {proc.returncode}, stopping")
             break
         try:
+            if pager:
+                pager.step()
             content = refresh() or content
         except Exception as e:
             logging.warning(f"vju: Failed to refresh content: {e}")
@@ -721,12 +761,20 @@ def draw_vju(texts, img_bg=False, font_sizes=None, alignment=None,
 class ManagedProcess:
 
     label = "process"
+    port = None
+    stop_timeout_s = 5
 
     def __init__(self):
         self.proc = None
 
     def answers(self):
-        return False
+        if self.port is None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                return True
+        except OSError:
+            return False
 
     def running(self):
         if self.proc is not None:
@@ -734,12 +782,12 @@ class ManagedProcess:
 
         return self.answers()
 
-    def stop(self, timeout_s=5):
+    def stop(self):
         if self.proc is None or self.proc.poll() is not None:
             return False
 
         logging.info(f"{self.label}: Stopping pid {self.proc.pid}")
-        terminate_process(self.proc, self.label, timeout_s)
+        terminate_process(self.proc, self.label, self.stop_timeout_s)
 
         return True
 
@@ -749,6 +797,7 @@ class ManagedProcess:
 class Compositor(ManagedProcess):
 
     label = "compositor"
+    stop_timeout_s = 10
 
     def __init__(self, socket_path=None):
         super().__init__()
@@ -823,9 +872,6 @@ class Compositor(ManagedProcess):
         logging.info(f"compositor: WAYLAND_DISPLAY={env.get('WAYLAND_DISPLAY')} "
                      f"SWAYSOCK={env.get('SWAYSOCK')}")
 
-    def stop(self, timeout_s=10):
-        return super().stop(timeout_s)
-
 # scream turns the compositor output into the stream the web ui plays, so it
 # is a compositor client like the views and is started by the controller once
 # the compositor is up, rather than by an exec line in the sway config
@@ -836,13 +882,6 @@ class StreamServer(ManagedProcess):
     def __init__(self, port=None):
         super().__init__()
         self.port = port or stream_http_port()
-
-    def answers(self):
-        try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=1):
-                return True
-        except OSError:
-            return False
 
     def start(self):
         if self.answers():
@@ -879,16 +918,9 @@ class WayvncServer(ManagedProcess):
                          or secrets.token_urlsafe(12))
         self.dir = os.path.join(env.get("XDG_RUNTIME_DIR", "/tmp"), "wayvnc")
 
-    def answers(self):
-        try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=1):
-                return True
-        except OSError:
-            return False
-
     # wayvnc's RSA-AES auth needs an RSA key, and naming a file that is not
     # there is fatal, not a fallback. certtool with --no-text writes it as
-    # PKCS#1, which is what nettle loads; a leading text summary is rejected.
+    # PKCS#1, which is what nettle loads. A leading text summary is rejected.
     # Without certtool the config leaves the line out and wayvnc mints its own
     def rsa_file(self):
         path = os.path.join(self.dir, "rsa_key.pem")
@@ -909,7 +941,7 @@ class WayvncServer(ManagedProcess):
 
         return None
 
-    # A self-signed cert keeps older VeNCrypt clients working; without certtool
+    # A self-signed cert keeps older VeNCrypt clients working. Without certtool
     # wayvnc still has RSA-AES, so a missing cert is not fatal
     def tls_files(self):
         key = os.path.join(self.dir, "tls_key.pem")
@@ -1007,25 +1039,14 @@ def debug_mode():
 def web_main(request):
     return HTMLResponse(HtmlPage.page_display())
 
-
-# Readiness
-def healthy(request):
+def health(request):
     return PlainTextResponse("OK")
 
-
-# Liveness
-def healthz(request):
-    return PlainTextResponse("OK")
-
-
+# The main process holds the playlist as a global. The uvicorn process asks it
+# over the state socket and, with the display not answering, rebuilds the list
+# from the URI env so the web ui still has items to show
 def get_playlist_items():
-    """
-    Return the current playlist's items, preferring the live global `playlist`
-    (set when running as __main__) and falling back to rebuilding it from the
-    URI/URIS env var (needed when running as a separate Daphne subprocess,
-    which never executes the __main__ block).
-    """
-    pl_global = globals().get('playlist') if 'playlist' in globals() else None
+    pl_global = globals().get('playlist')
     if pl_global:
         return pl_global.playlist
 
@@ -1033,17 +1054,10 @@ def get_playlist_items():
     if live:
         return live
 
-    uris_env = os.environ.get('URI') or os.environ.get('URIS')
-    if not uris_env:
-        return []
-    for sep in ["|", " "]:
-        uris_env = uris_env.replace(sep, " ")
-    uris_list = [u.strip() for u in uris_env.split() if u.strip()]
-    if not uris_list:
-        return []
+    uris_env = os.environ.get('URI') or os.environ.get('URIS') or ""
+    uris_list = [u.strip() for u in uris_env.split("|")] if uris_env else []
     try:
-        tmp_pl = Playlist(uris_list, 5, Theme('default'), [], None)
-        return tmp_pl.create(uris_list)
+        return Playlist(uris_list, 5, Theme('default'), [], None).playlist
     except Exception:
         return []
 
@@ -1076,15 +1090,11 @@ def display_screenshot(request):
     return Response(content=data, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})
 
-def list_routes(app_instance=None):
-    """
-    Return a list of all registered routes in the ASGI app.
-    Each entry contains: path, methods, and route name.
-    """
+def list_routes():
     return [{"path": getattr(r, "path", ""),
              "methods": sorted(getattr(r, "methods", None) or []),
              "name": getattr(r, "name", "")}
-            for r in (app_instance or app).routes]
+            for r in app.routes]
 
 def api_routes(request):
     return JSONResponse(list_routes())
@@ -1222,12 +1232,11 @@ def api_playlist_toggle(request):
     return display_call("toggle_playlist_item", "toggle_item",
                         request.path_params.get("num"))
 
-# Prepare ASGI app for API and web ui
 app = Starlette(routes=[
     Route("/", web_main, methods=["GET"], name="web_main"),
     Route("/display", web_main, methods=["GET"], name="web_display"),
-    Route("/healthy", healthy, methods=["GET"], name="healthy"),
-    Route("/healthz", healthz, methods=["GET"], name="healthz"),
+    Route("/healthy", health, methods=["GET"], name="healthy"),
+    Route("/healthz", health, methods=["GET"], name="healthz"),
     Route("/api/v1/display", screen, methods=["GET"], name="api_display"),
     Route("/screenshot", display_screenshot, methods=["GET"], name="screenshot"),
     Route("/api/v1/screenshot", display_screenshot, methods=["GET"], name="api_screenshot"),
@@ -1258,40 +1267,7 @@ app = Starlette(routes=[
 ], middleware=[Middleware(RequestCounter)])
 
 
-def download_file(url, path):
-    logging.info(f"Downloading: {url}")
-
-    # path is the destination directory and the filename comes from the url,
-    # which is what the curl -LO --output-dir this replaces did. curl itself
-    # is no longer in the image
-    os.makedirs(path, exist_ok=True)
-    filename = url.rstrip("/").rsplit("/", 1)[-1] or "download"
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logging.error(f"download: {url}: {e}")
-
-        return False
-
-    with open(os.path.join(path, filename), "wb") as file:
-        file.write(response.content)
-
-    return True
-
-
-# An older doi has no caption method and may hand back a plain string
-# instead of a meta dict; the title carries until it does
-def image_caption(meta, source):
-    if isinstance(meta, dict):
-        if hasattr(source, "caption"):
-            return source.caption(meta)
-
-        return meta.get("title") or ""
-
-    return str(meta or "")
-
-# PIL opens it -- so draw_image can too. Not every "picture of the day" is an
+# PIL opens it, so draw_image can too. Not every "picture of the day" is an
 # image: APOD is a video some days, and a downloaded embed page is not one
 # either, and Image.open on that kills the view thread
 def is_image_file(path):
@@ -1322,10 +1298,6 @@ def draw_captioned_image(img_path, caption, bg_colour="#000000"):
     wv.show_image(img_path, bg_colour=bg_colour)
 
 def draw_apod():
-    """
-    Draws the Astronomy Picture of the Day (APOD) for the current day,
-    with the attribution captioned under it the way the art views do.
-    """
     key = globals().get('apod_api_key') or os.environ.get('APOD_API_KEY') or 'DEMO_KEY'
     img_path, meta = APOD(api_key=key).apod_data()
     if not meta:
@@ -1333,8 +1305,8 @@ def draw_apod():
         metrics.inc("iss_display_fetch_failures_total", source="apod")
         return
 
-    caption = image_caption(meta, Art) if isinstance(meta, dict) else ""
-    # A video day has meta but no image; fall back to the caption and blurb
+    caption = render.art_caption(meta)
+    # A video day has meta but no image, so fall back to the caption and blurb
     if not img_path and isinstance(meta, dict) and meta.get("description"):
         caption = f"{caption}\n\n{meta['description']}".strip()
     draw_captioned_image(img_path, caption, bg_colour="#000000")
@@ -1343,40 +1315,25 @@ def draw_apod():
 # done once when the view starts rather than on a timer: the numbers barely
 # move on an appliance and a walk is the most expensive thing any view does
 def draw_sizes(kind, path=None):
-    """
-    Draws the biggest files or directories under a path.
-    Args:
-        kind (str): 'files' or 'dirs'.
-        path (str): Where to look, defaults to the item's path or /.
-    """
     if path is None:
         item = playlist_item()
         path = (item or {}).get("scan_path") or "/"
 
-    reader = System.biggest_files if kind == "files" else System.biggest_dirs
     try:
-        text = reader(path, 12)
+        lines = render.size_lines(System.scan_sizes(path, 12), kind)
     except Exception as e:
         logging.error(f"sizes: Failed to scan {path}: {e}")
         metrics.inc("iss_display_fetch_failures_total", source=kind)
 
         return
 
-    wv = Wayland_view(display.res_x, display.res_y, 1, theme)
-    wv.s_objects[0]["font_size"] = 18
-    wv.s_objects[0]["alignment"] = "left"
-    wv.show_content([header_gap(text)])
+    draw([header_gap("\n".join(lines))], font_sizes=[18], alignment="left")
 
-# iss://art/<source>; the bare iss://art keeps working and means ngoa
+# iss://art/<source>. The bare iss://art keeps working and means ngoa
 art_sources = {"ngoa": ArtNGA, "mmoa": ArtMet}
 default_art_source = "ngoa"
 
 def draw_art(source=None):
-    """
-    Draws a work from one of the museum collections.
-    Args:
-        source (str): 'ngoa' for the National Gallery, 'mmoa' for the Met.
-    """
     if source is None:
         item = playlist_item()
         source = (item or {}).get("art_source", default_art_source)
@@ -1394,37 +1351,30 @@ def draw_art(source=None):
 
         return
 
-    draw_captioned_image(img_path, image_caption(meta, collection))
+    draw_captioned_image(img_path, render.art_caption(meta))
 
+# The current month with today and its day name highlighted, a big day-of-month
+# numeral beside the grid sized to the grid's height, and the next bank
+# holidays underneath. iss://calendar/<country> picks whose holidays
 def draw_calendar():
-    """
-    Draws a calendar for the current month, highlighting the current day and
-    day name, with a big day-of-month numeral to the right of the grid, sized
-    to the grid's own height, and the next bank holidays underneath.
-    """
-    import datetime
-
-    # The month lines come from doi; the pango markup for the highlights is
+    country = (playlist_item() or {}).get("holiday_country", "Germany")
+    # The month lines come from doi. The pango markup for the highlights is
     # ours, since it belongs to this renderer. Colours come from the theme
     accent = theme.highlight_colour
     body = theme.font_colour
     face = theme.font_face or "Monospace"
 
-    def highlight(match):
+    def highlight(text):
         return (f'</span><span foreground="{accent}" font="{face} 23">'
-                f'{match.group(0)}</span>'
+                f'{text}</span>'
                 f'<span foreground="{body}" font="{face} 20">')
 
-    def highlight_day_name(match):
-        return (f'<span foreground="{accent}" font="{face} 23">'
-                f'{match.group(0)}</span>')
+    def highlight_day_name(text):
+        return f'<span foreground="{accent}" font="{face} 23">{text}</span>'
 
-    if hasattr(Calendar, "month_text"):
-        lines = Calendar.month_text(highlight, highlight_day_name)
-        holidays = Calendar.holiday_lines(location="Germany", count=3)
-    else:
-        lines = ["Calendar view needs a newer doi"]
-        holidays = []
+    lines = render.calendar_lines(Calendar.month(), highlight, highlight_day_name)
+    holidays = render.holiday_lines(
+        Calendar.next_bank_holidays(location=country, count=3))
 
     texts = ["\n".join(lines), str(datetime.date.today().day)]
     if holidays:
@@ -1479,13 +1429,9 @@ class Zeroconf_service:
     def register(self):
         self.zc.register_service(self.zc_service)
 
-        return True
-
     def unregister(self):
         self.zc.unregister_service(self.zc_service)
         self.zc.close()
-
-        return True
 
 
 def load_toml_table(filename, name):
@@ -1562,7 +1508,7 @@ class Theme:
         self.view_indicator_colour = os.environ.get(
             "THEME_VIEW_INDICATOR_COLOUR", self.font_colour)
         # A complementary accent for the bits a view wants to stand out, the
-        # calendar's current day among them; overridable, else derived
+        # calendar's current day among them. Overridable, else derived
         bg = parse_colour(self.bg_colour) or parse_colour(self.default_bg_colour)
         fg = parse_colour(self.font_colour) \
             or parse_colour(self.default_font_colour)
@@ -1586,7 +1532,6 @@ class Playlist:
                  name=""):
 
         self.name = name
-        self.download_path = "/tmp/"
         self.location = location
         self.default_play_time_s = default_play_time_s
         self.news = None
@@ -1712,11 +1657,9 @@ class Playlist:
 
     feed_suffixes = ('/rss', '/feed', '/atom', '.rss', '.atom', '.xml')
 
+    # The player for a uri, and the uri as the item will carry it. (None, uri)
+    # for one we do not know how to show
     def classify(self, uri):
-        '''
-        The player for a uri, and the uri as the item will carry it.
-        (None, uri) for one we do not know how to show.
-        '''
         if uri.endswith((".m3u8", ".m3u")):
             return "mediaplayer", uri
         if uri.startswith("https://"):
@@ -1724,10 +1667,6 @@ class Playlist:
                    for s in self.feed_suffixes):
                 return "news", uri
             return "browser", uri
-        if uri.endswith(".svg"):
-            download_file(uri.strip(), self.download_path)
-            return "imageviewer", \
-                "file:///" + self.download_path + uri.rsplit("/", 1)[-1]
         if uri.endswith(".jpg"):
             return "imageviewer", uri
 
@@ -1737,11 +1676,9 @@ class Playlist:
 
         return None, uri
 
+    # The fields and constructions a player needs beyond the uri. None drops
+    # the item
     def item_extras(self, uri, player):
-        '''
-        The fields and constructions a player needs beyond the uri.
-        None drops the item.
-        '''
         if player == "news":
             if uri.startswith("https://"):
                 return {"news": RSSFeed(uri)}
@@ -1761,6 +1698,9 @@ class Playlist:
         if player == "weather":
             self.weather = Weather(self.location)
             return {}
+        if player == "calendar":
+            wanted = uri[len("iss://calendar"):].strip("/")
+            return {"holiday_country": wanted or "Germany"}
         if player == "art":
             wanted = uri[len("iss://art"):].strip("/").lower()
             return {"art_source": (wanted if wanted in art_sources
@@ -1769,7 +1709,7 @@ class Playlist:
             wanted = uri[len(f"iss://system/{player}"):].strip()
             return {"scan_path": wanted if wanted.startswith("/") else "/"}
         if player == "prometheus":
-            # iss://prometheus/<endpoint>/<metric>[,<metric>...]; the endpoint
+            # iss://prometheus/<endpoint>/<metric>[,<metric>...]. The endpoint
             # keeps its own path, so the metric names are the last segment
             endpoint, _, wanted = uri[len("iss://prometheus/"):].rpartition("/")
             names = [n for n in wanted.split(",") if n]
@@ -1792,11 +1732,11 @@ class Playlist:
         return {}
 
     def create(self, uris):
-        playlist = list()
+        playlist = []
 
         # The double bar survives the split as an empty element. After the
-        # first uri it pins that view full and cycles the rest in the corner;
-        # before the last uri it cycles the rest full and pins the last in
+        # first uri it pins that view full and cycles the rest in the corner.
+        # Before the last uri it cycles the rest full and pins the last in
         # the corner
         head = len(uris) > 1 and str(uris[1]).strip() == ""
         tail = not head and len(uris) > 2 and str(uris[-2]).strip() == ""
@@ -1854,7 +1794,7 @@ class Playlist:
 
     def start_player(self, probe_ip_address):
         self.probe_ip_address = probe_ip_address
-        threads = list()
+        threads = []
         for item in self.playlist:
             if not item.get("enabled", True):
                 logging.info(f"Skipping disabled item {item['num']}: {item['uri']}")
@@ -1868,7 +1808,7 @@ class Playlist:
 
     # An item has two times: play_time_s is how long the view is shown (the
     # t= param), refresh_s how often its content is fetched again (the
-    # refresh= param). Content refreshes once per showing by default; a
+    # refresh= param). Content refreshes once per showing by default. A
     # refresh= only slows that down, never below the presentation time, so a
     # poll never runs more often than the view is on screen
     @staticmethod
@@ -2048,34 +1988,45 @@ class Playlist:
             spawn([cmds["clock"]])
             return True
         except Exception as e:
-            logging.error(f"Clock start failed: {e}")
+            logging.error(f"clock: Failed to start: {e}")
             return False
 
+    # One view per topic, showing the last message. The broker callback only
+    # stores the texts, the view's own refresh timer picks them up, so a
+    # message never blocks the client loop
     def start_mqtt_views(self, topics, theme):
-        mqtt_client_id = "iss-display-42"
-        mqtt = MQTT(mqtt_broker,
-                    mqtt_client_id,
-                    mqtt_port,
-                    mqtt_user,
-                    mqtt_pw)
         if not topics:
-            logging.info("MQTT: No topics configured; skipping MQTT view subscriptions")
+            logging.info("MQTT: No topics configured, skipping the view")
             return False
+
+        mqtt = MQTT(mqtt_broker, "iss-display-42", mqtt_port, mqtt_user, mqtt_pw)
         try:
             mqttc = mqtt.connect()
-        except Exception:
-            logging.info("MQTT: Failed to connect")
+        except Exception as e:
+            logging.warning(f"MQTT: Failed to connect: {e}")
             return False
 
-        def render_mqtt_view(topic, texts):
-            wv = Wayland_view(display.res_x, display.res_y, len(texts), theme)
-            for i in range(len(texts)):
-                wv.s_objects[i]["font_size"] = 64 if i == 0 else 48
-                wv.s_objects[i]["alignment"] = "center"
-            wv.show_content(texts, theme.img_bg)
+        latest = {topic: [topic, "Waiting for a message"] for topic in topics}
+        lock = threading.Lock()
+        item = playlist_item()
+
+        def on_message(topic, _msg_topic, payload):
+            with lock:
+                latest[topic] = render.mqtt_lines(topic, payload)
+
+        def show(topic):
+            def texts():
+                with lock:
+                    return list(latest[topic])
+
+            draw(texts(), img_bg=theme.img_bg, font_sizes=[64, 48],
+                 alignment="center", refresh=texts, refresh_interval_s=1)
 
         for topic in topics:
-            mqtt.subscribe(mqttc, topic, render_mqtt_view)
+            mqtt.subscribe(mqttc, topic, partial(on_message, topic))
+            thread = threading.Thread(target=show, args=(topic,), daemon=True)
+            thread.playlist_item = item
+            thread.start()
             logging.info(f"MQTT: Subscribed to {topic}")
 
         mqttc.loop_forever()
@@ -2083,7 +2034,7 @@ class Playlist:
     # (video variant to play, audio rendition playlist or None). Broadcast HLS
     # commonly carries the audio as a separate rendition rather than muxed into
     # the video segments, and legacy hlsdemux plays only the one stream it is
-    # given -- so the rendition is fetched as a second source
+    # given, so the rendition is fetched as a second source
     @staticmethod
     def hls_sources(url):
         max_h = int(os.environ.get("MEDIA_MAX_HEIGHT") or 720)
@@ -2143,8 +2094,8 @@ class Playlist:
             text = requests.get(playlist_url, timeout=15).text
         except requests.RequestException:
             return False
-        seg = next((l.strip() for l in text.splitlines()
-                    if l.strip() and not l.startswith("#")), "")
+        seg = next((line.strip() for line in text.splitlines()
+                    if line.strip() and not line.startswith("#")), "")
         return seg.split("?", 1)[0].lower().endswith((".ts", ".m2ts"))
 
     # The stream urls in an .m3u (an IPTV channel list), each paired with the
@@ -2226,15 +2177,12 @@ class Playlist:
         # otherwise off a second hlsdemux on the audio rendition, which legacy
         # hlsdemux does not follow on its own
         # MEDIA_PIPELINE replaces the whole pipeline, {url} substituted
-        # A corner pip takes its size from the compositor, so only a full
-        # view asks the sink for fullscreen. Read the role off the playlist
-        # item rather than the thread, so media_step off the state socket
-        # gets it right too
-        media_item = next((i for i in (self.playlist or [])
-                           if i.get("player") == "mediaplayer"),
-                          playlist_item())
+        # In a pip layout the full slot is tiled and fills the output on its
+        # own, and a fullscreen surface would hide the corner view, so only a
+        # plain rotation asks the sink for fullscreen. Read off the playlist
+        # rather than the thread, so media_step off the state socket agrees
         sink = ["waylandsink", "sync=true"]
-        if not pip_corner(media_item):
+        if not any(i.get("pip") for i in self.playlist or []):
             sink.insert(1, "fullscreen=true")
 
         audio_port = stream_audio_port()
@@ -2287,29 +2235,22 @@ class Playlist:
     def start_net_view(self, img_bg, probe_ip_address):
         net = System.net_data(probe_ip_address)
         text = kv_table([("Network Address", net["address"]),
-                         ("Network Addresses", net["addresses"]),
+                         ("Network Addresses", render.address_lines(net["addresses"])),
                          ("Public IP", net["public_ip"]),
                          ("resolv.conf", net["resolvconf"])])
-        wv = Wayland_view(display.res_x, display.res_y, 1, theme)
-        wv.s_objects[0]["font_size"] = 20
-        wv.s_objects[0]["alignment"] = "left"
-        wv.show_content([text], img_bg)
+        draw([text], img_bg=img_bg, font_sizes=[20], alignment="left")
 
     def start_sockets_view(self, img_bg, refresh_interval_s=5,
                            method="python-wayland"):
         draw_paged_view("Sockets",
-                        lambda: (System.net_sockets() or "").splitlines(),
+                        lambda: render.socket_lines(System.net_socket_list()),
                         img_bg, refresh_interval_s, method=method)
 
     def start_neighbours_view(self, img_bg, refresh_interval_s=5,
                               method="python-wayland"):
-        def lines():
-            if not hasattr(System, "net_neighbours"):
-                return ["Neighbours view needs a newer doi"]
-            return (System.net_neighbours() or "").splitlines()
-
-        draw_paged_view("Neighbours", lines, img_bg, refresh_interval_s,
-                        method=method)
+        draw_paged_view("Neighbours",
+                        lambda: render.neighbour_lines(System.net_neighbour_list()),
+                        img_bg, refresh_interval_s, method=method)
 
     def start_date_view(self, refresh_interval_s=1, title=None):
         draw([], method="vju", alignment="center", title=title,
@@ -2335,13 +2276,12 @@ class Playlist:
         lock = threading.Lock()
 
         def trace():
-            text = System.traceroute(target)
+            text = "\n".join(render.traceroute_lines(System.traceroute(target)))
             with lock:
                 state["text"] = text
                 state["running"] = False
 
-            with content_refreshers_lock:
-                refresher = content_refreshers.get(num)
+            refresher = content_refresher(num)
             if refresher:
                 refresher.due_now()
 
@@ -2370,7 +2310,8 @@ class Playlist:
     def start_top_view(self, img_bg, refresh_interval_s=5,
                        method="python-wayland"):
         def top_texts():
-            return [header_gap(System.top(20) or "No process data")]
+            return [header_gap("\n".join(render.top_lines(System.process_cpu_times()))
+                               or "No process data")]
 
         draw(top_texts(), method=method, img_bg=img_bg,
              font_sizes=[20], alignment="left", title="Top",
@@ -2392,14 +2333,14 @@ class Playlist:
              font_sizes=[font_size], alignment="left", title="Log",
              refresh=log_texts, refresh_interval_s=refresh_interval_s)
 
-    # iss://prometheus/<endpoint>/<metric>[,<metric>...] -- fetch those metrics
+    # iss://prometheus/<endpoint>/<metric>[,<metric>...]: fetch those metrics
     # from a /metrics endpoint and show each series as a key/value row
     def start_prometheus_view(self, url, metrics, img_bg,
                               refresh_interval_s=10, method="python-wayland"):
         client = PrometheusClient(url)
 
         # Underscores out of the metric name for a readable key, but not out
-        # of the labels -- a path label is real data
+        # of the labels, a path label is real data
         def label(series):
             name, brace, rest = series.partition("{")
             return name.replace("_", " ") + brace + rest
@@ -2423,8 +2364,7 @@ class Playlist:
                             method="python-wayland"):
         font_size = 20
         cols = max(48, int((display.res_x - 80) / (font_size * 0.8)))
-        page_lines = text_rows(font_size, 2)
-        state = {"page": 0}
+        pager = Pager(text_rows(font_size, 2))
 
         def entry_blocks():
             items = get_playlist_items()
@@ -2452,84 +2392,46 @@ class Playlist:
             blocks = entry_blocks()
             if not blocks:
                 return ["Playlist unavailable"]
-            pages, cur = [], []
-            for block in blocks:
-                if cur and len(cur) + len(block) > page_lines:
-                    pages.append(cur)
-                    cur = []
-                cur.extend(block)
-            if cur:
-                pages.append(cur)
-            page = state["page"] % len(pages)
-            state["page"] = page + 1
+            rows, counter = pager.paginate(blocks)
             name = self.name or "Playlist"
-            counter = "" if len(pages) == 1 else f" {page + 1}/{len(pages)}"
-            return ["\n".join([f"{name}{counter} ({len(blocks)})", ""]
-                              + pages[page])]
+
+            return ["\n".join([f"{name}{counter} ({len(blocks)})", ""] + rows)]
 
         draw(texts(), method=method, img_bg=img_bg, font_sizes=[font_size],
-             alignment="left", title="Playlist",
+             alignment="left", title="Playlist", pager=pager,
              refresh=texts, refresh_interval_s=refresh_interval_s)
 
     def start_proc_view(self, img_bg, refresh_interval_s=5,
                         method="python-wayland"):
         draw_paged_view("Processes",
-                        lambda: (System.list_processes() or "").splitlines(),
+                        lambda: render.process_lines(System.process_list()),
                         img_bg, refresh_interval_s, method=method, split=True)
 
     def start_sys_view(self, img_bg, probe_ip_address):
         net = System.net_data(probe_ip_address)
-        sys_info = System.sys_data()
-
-        uptime_info = System.uptime(env)
-        if isinstance(uptime_info, dict):
-            uptime, users, load = (uptime_info.get("uptime", ""),
-                                   uptime_info.get("users", ""),
-                                   uptime_info.get("load", ""))
-        else:
-            uptime, users, load = str(uptime_info), "", ""
+        up = System.host_uptime_seconds()
+        load = System.load_average()
 
         online = (net["online_status"] or "") + " " + (net["public_ip"] or "")
-        # The host_uptime kernel is the container's host or its vm
+        # The uptime is the kernel's, the container's host or its vm
         rows = [("OS", System.os_release()),
-                ("Uptime", uptime),
-                ("Users", users),
-                ("Load", load),
+                ("Up", render.duration(up) if up is not None else ""),
+                ("Load", ", ".join(f"{v:.2f}" for v in load) if load else ""),
                 ("Display started", display.started),
-                ("Host up", System.host_uptime()),
-                ("System uptime", sys_info["uptime"]),
                 ("Resolution", f"{display.res_x}x{display.res_y}"),
-                ("Memory", (System.mem_data() or "").replace("Memory: ", "", 1)),
-                ("System", sys_info["data"]),
+                ("Memory", render.memory_text(System.memory())),
+                ("System", System.sysdata()),
                 ("Address", net["address"]),
-                ("Addresses", net["addresses"]),
+                ("Addresses", render.address_lines(net["addresses"])),
                 ("Online", online),
                 ("Listen address",
                  "\n".join(listen_endpoints(display.address, display.port)))]
 
-        wv = Wayland_view(display.res_x, display.res_y, 1, theme)
-        wv.s_objects[0]["font_size"] = 20
-        wv.s_objects[0]["alignment"] = "left"
-        wv.show_content([kv_table(rows)], img_bg)
+        draw([kv_table(rows)], img_bg=img_bg, font_sizes=[20], alignment="left")
 
     def start_weather_view(self, weather, img_bg):
-        if hasattr(weather, "report"):
-            texts, icon = weather.report()
-        else:
-            texts, icon = ["Weather view needs a newer doi"], None
-
-        # Sized for the headline lines even when the fetch came back short,
-        # so a failed lookup does not index past the drawing objects
-        font_sizes = [80, 40, 20]
-        wv = Wayland_view(display.res_x, display.res_y,
-                          max(len(texts), len(font_sizes)), theme)
-        for i in range(len(wv.s_objects)):
-            wv.s_objects[i]["font_size"] = font_sizes[min(i, len(font_sizes) - 1)]
-            wv.s_objects[i]["alignment"] = "left"
-
-        wv.show_content(texts, img_bg)
-        if icon:
-            wv.show_image(icon)
+        draw(render.weather_lines(weather.current()), img_bg=img_bg,
+             font_sizes=[80, 40, 20], alignment="left")
 
     def start_music_view(self, img_bg, refresh_interval_s):
         music = Music()
@@ -2570,10 +2472,6 @@ class Playlist:
         draw_item_view(fetch, render, [30, 20, 60, 20, 30], img_bg,
                        refresh_interval_s, overlays=2, source="spotify")
 
-    # The rotation advances this view as it leaves the screen; the interval is
-    # only a fallback for the case where it is never shown
-    # Encoding is cached on disk by url, so a view redrawing the same item
-    # re-uses the png rather than shelling out again
     # A qr-code is a grid of modules and its pixel size follows from how much
     # data it carries, so a fixed scale makes a long url a far bigger image
     # than a short one. The view has room for a fixed box, so ask for that
@@ -2583,17 +2481,16 @@ class Playlist:
     def qr_code(url, target_px=None, dark=None, light=None):
         if not url:
             return ""
+
+        target_px = target_px or Playlist.qr_target_px
+        key = f"qr {url} {target_px} {dark} {light}"
+        path = cache.path(key)
+        if path:
+            return path
         try:
-            try:
-                return encode_qr(url,
-                                 target_px=target_px or Playlist.qr_target_px,
-                                 dark=dark, light=light)
-            except TypeError:
-                logging.warning("qr: encoder does not take colours, "
-                                "encoding without")
-                return encode_qr(url,
-                                 target_px=target_px or Playlist.qr_target_px)
-        except QREncodeError as e:
+            return cache.put(key, encode_png(url, target_px=target_px,
+                                             dark=dark, light=light), ".png")
+        except (QREncodeError, OSError) as e:
             logging.warning(f"qr: {e}")
             return ""
 
@@ -2646,7 +2543,7 @@ class Playlist:
 
         def render(wv, item):
             if not item:
-                return [f"@{bsky.actor}", "", "No posts", "", ""], [""]
+                return [f"@{bsky.actor}", "", "No posts", "", ""], ["", ""]
 
             name = item.get("feed", "")
             handle = item.get("handle", "")
@@ -2655,15 +2552,23 @@ class Playlist:
             text = item.get("text") or item.get("title", "")
             link = item.get("link") or item.get("url", "")
 
-            # The qr is a small corner overlay; the post's picture, when it
-            # has one, is the last file and gets the full-height side column
+            # slot 5 is the qr corner overlay, slot 6 the post picture when it
+            # has one, which the grid gives the full-height side column
             return ([header, "", text, "", link],
                     [wv.qr(link), item.get("image", "")])
 
-        draw_item_view(fetch, render, [28, 18, 42, 18, 22], img_bg,
+        draw_item_view(fetch, render, [28, 18, 38, 18, 22], img_bg,
                        refresh_interval_s, overlays=2, source="bluesky",
-                       draw_function=view.draw_text_and_image,
-                       alignments={2: "left"})
+                       draw_function=view.draw_grid,
+                       alignments={2: "left"},
+                       grid={"cols": ["1fr", "auto"],
+                             "rows": ["auto", "1fr", "auto"],
+                             "cells": [{"slot": 0, "col": 0, "row": 0},
+                                       {"slot": 2, "col": 0, "row": 1,
+                                        "valign": "start"},
+                                       {"slot": 4, "col": 0, "row": 2},
+                                       {"slot": 6, "col": 1, "row": 0,
+                                        "rowspan": 3, "fit": "contain"}]})
 
     def start_onthisday_view(self, otd, img_bg, refresh_interval_s):
         num = view_num()
@@ -2685,7 +2590,6 @@ class Playlist:
 
             url = item.get("url", "")
 
-            # Add a margin (empty line) between the year and the text
             return [item["year"], "", item["text"], "", url], [wv.qr(url)]
 
         draw_item_view(fetch, render, [40, 30, 30, 20, 20], img_bg,
@@ -2766,7 +2670,7 @@ class Mosaic:
                'videoconvert', '!'] + shlex.split(sink.replace("!", " ! "))
 
         logging.info(f"mosaic: {' '.join(cmd)}")
-        self.gst = Popen(cmd, env=env, shell=False, stdin=subprocess.PIPE)
+        self.gst = Popen(cmd, env=env, stdin=subprocess.PIPE)
 
         return self.gst
 
@@ -2785,112 +2689,15 @@ class Mosaic:
 
         logging.info("mosaic: Stopped")
 
-class Stream():
+class Stream:
 
     def __init__(self, stream_source):
-        self.streams = list()
-
-        if stream_source == "v4l2":
-            logging.info("Setting up source")
-            self.stream_create_v4l2_src(stream_source_device)
-            logging.info("Setting up stream")
-            time.sleep(3)
-            self.stream_v4l2_ffmpeg()
-
-        elif stream_source == "mosaic":
+        self.streams = []
+        if stream_source == "mosaic":
             self.mosaic = Mosaic(display.res_x, display.res_y,
                                  int(os.environ.get("MOSAIC_FPS", "5")))
-            x = threading.Thread(target=self.mosaic.run, daemon=True)
-            x.start()
+            threading.Thread(target=self.mosaic.run, daemon=True).start()
             self.streams.append("mosaic")
-
-        elif stream_source == "static-images":
-            gst = self.stream_setup_gstreamer(stream_source,
-                                              stream_source_device,
-                                              local_ip,
-                                              listen_port)
-
-            self.gst_stream_images(gst, img_path)
-            gst.stdin.close()
-            gst.wait()
-
-    def stream_setup_gstreamer(self, stream_source, source_device, ip, port):
-        if stream_source == "static-images":
-            gstreamer = subprocess.Popen([
-                'gst-launch-1.0', '-v', '-e',
-                'fdsrc',
-                '!', 'jpegdec',
-                '!', 'videoconvert',
-                '!', 'videorate',
-                '!', 'video/x-raw,framerate=25/2',
-                '!', 'theoraenc',
-                '!', 'oggmux',
-                '!', 'tcpserversink', 'host=' + ip + '',
-                'port=' + str(port) + ''
-                ], stdin=subprocess.PIPE, env=env)
-
-        elif stream_source == "v4l2":
-            gstreamer = subprocess.Popen([
-                'gst-launch-1.0', '-v', '-e',
-                'v4l2src', 'device=' + source_device,
-                '!', 'videorate',
-                '!', 'video/x-raw,framerate=25/2',
-                '!', 'queue',
-                '!', 'tcpserversink', 'host=' + ip + '',
-                'port=' + str(port) + ''
-                ], stdin=subprocess.PIPE, env=env)
-
-        return gstreamer
-
-    def gst_stream_images(self, gstreamer, img_path):
-        filename = '/tmp/screenshot.jpg'
-        streaming = False
-
-        while True:
-            if not Path(filename).is_file():
-                logging.info("Startup: No file yet to stream, waiting..")
-                time.sleep(3)
-                continue
-
-            if not streaming:
-                logging.info("Found first file, starting stream")
-                streaming = True
-
-            with open(filename, 'rb') as f:
-                gstreamer.stdin.write(f.read())
-            time.sleep(0.1)
-
-    def stream_create_v4l2_src(self, device):
-        # Check if device is an existing character device
-        if not stat.S_ISCHR(os.lstat(device)[stat.ST_MODE]):
-            logging.error(f"{device} does not exist, aborting..")
-            sys.exit(1)
-
-        # Create v4l2 recording of screen
-        logging.info(f"Creating v4l2 stream with device: {device}")
-        p = subprocess.Popen([
-                    'wf-recorder',
-                    '--muxer=v4l2',
-                    '--file=' + device,
-                    ],
-                    stdin=subprocess.PIPE,
-                    start_new_session=True,
-                    close_fds=False,
-                encoding='utf8',
-                env=env)
-
-        # Handle wf-recorder prompt for overwriting the file
-        p.stdin.write('Y\n')
-        p.stdin.flush()
-
-        return True
-
-    def stream_v4l2_ffmpeg(self):
-        subprocess.Popen([
-            'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
-            '-codec', 'copy',
-            '-f', 'mpegts', 'udp:0.0.0.0:6000'
-            ], env=env)
 
 
 # Timer for the wayland eventlist, which expects a nexttime attribute
@@ -2899,8 +2706,9 @@ class Stream():
 class Content_refresh:
 
     def __init__(self, wayland_view, window, refresh, interval_s, html_escape,
-                 refresh_when_hidden=False):
+                 refresh_when_hidden=False, pager=None):
         item = playlist_item()
+        self.pager = pager
         self.source = item["player"] if item else "unknown"
         self.num = str(item["num"]) if item else "0"
         self.wayland_view = wayland_view
@@ -2916,8 +2724,13 @@ class Content_refresh:
         with content_refreshers_lock:
             content_refreshers[self.num] = self
 
+    def unregister(self):
+        with content_refreshers_lock:
+            if content_refreshers.get(self.num) is self:
+                del content_refreshers[self.num]
+
     # Called from the rotation when the view leaves the screen. Only the
-    # deadline is moved here; the refresh itself happens on the view's own
+    # deadline is moved here. The refresh itself happens on the view's own
     # thread next time round its loop, which the waker brings on at once.
     # A zero would never fire: the loop tests mainloopnexttime for truth
     def due_now(self):
@@ -3026,24 +2839,19 @@ class Wayland_view:
             "/usr/share/wayland/wayland.xml",
             "/usr/local/share/wayland/wayland.xml")
         if wp_base is None:
-            logging.error("wayland: Failed to find wayland protocol xml")
-            sys.exit(1)
+            raise RuntimeError("wayland: Failed to find wayland protocol xml")
 
         wp_xdg_shell = wayland_protocol(
             "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml",
             "/usr/local/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
         if wp_xdg_shell is None:
-            logging.error("wayland: Failed to find wayland protocol shell xml")
-            sys.exit(1)
+            raise RuntimeError("wayland: Failed to find wayland protocol shell xml")
 
         try:
             self.conn = view.WaylandConnection(wp_base, wp_xdg_shell)
         except FileNotFoundError as e:
-            if e.errno == 2:
-                print("Unable to connect to the compositor - "
-                      "is one running?")
-                sys.exit(1)
-            raise
+            raise RuntimeError("wayland: Unable to connect to the compositor, "
+                               "is one running?") from e
 
         item = playlist_item()
         # A corner view renders into a small surface so the compositor floats
@@ -3067,7 +2875,7 @@ class Wayland_view:
             self.window["after_draw"] = partial(draw_view_indicator,
                                                 count, num, rgb)
 
-        # The theme sets the view background and text colours; a per-item
+        # The theme sets the view background and text colours, and a per-item
         # bg_colour from the web ui overrides the background
         bg_r, bg_g, bg_b = parse_colour(theme.bg_colour) or (40, 15, 40)
         stored = (item or {}).get("bg_colour")
@@ -3094,10 +2902,11 @@ class Wayland_view:
                     "file": "",
                     "img_scale_up": True,
                     "img_scale_down": True,
-                    "text": list()}
+                    "text": []}
 
         self.repaint_pending = False
         self.live_window = None
+        self.refresher = None
         self.s_objects = [s_object.copy() for _ in range(num_objects)]
 
     def colours(self):
@@ -3116,7 +2925,7 @@ class Wayland_view:
 
         return Playlist.qr_code(url, dark=fg, light=bg)
 
-    # The surface is already pip_scale() of the output; shrink the fonts and
+    # The surface is already pip_scale() of the output, so shrink the fonts and
     # offsets to match so the layout is the full view in miniature
     def scale_pip(self):
         if not self.pip:
@@ -3163,6 +2972,8 @@ class Wayland_view:
                     live_views.remove(entry)
             metrics.inc("iss_display_views_running", -1)
             metrics.inc("iss_display_view_exits_total", reason=reason)
+            if self.refresher:
+                self.refresher.unregister()
 
         try:
             w.close()
@@ -3186,7 +2997,7 @@ class Wayland_view:
 
     def show_content(self, texts, img_bg=False, fullscreen=False, html_escape=True,
                      refresh=None, refresh_interval_s=None,
-                     refresh_when_hidden=False, draw_function=None):
+                     refresh_when_hidden=False, draw_function=None, pager=None):
         logging.debug(f"view: Have {len(texts)} text block(s)")
 
         self.set_texts(texts, html_escape)
@@ -3197,8 +3008,8 @@ class Wayland_view:
                 logging.debug(f"view: s_objects[{idx}] file {obj['file']}")
 
         if draw_function is None:
-            # A background image is object 0's file; draw_text paints it
-            # cover-scaled and lays the text out over it
+            # A background image is object 0's file, which draw_text paints
+            # cover-scaled and lays the text out over
             if img_bg:
                 self.s_objects[0]["file"] = img_bg
             draw_function = view.draw_text
@@ -3211,9 +3022,10 @@ class Wayland_view:
                         class_="iss-view")
 
         if refresh and refresh_interval_s:
-            self.conn.eventlist.append(
-                Content_refresh(self, w, refresh, refresh_interval_s,
-                                html_escape, refresh_when_hidden))
+            self.refresher = Content_refresh(self, w, refresh, refresh_interval_s,
+                                             html_escape, refresh_when_hidden,
+                                             pager)
+            self.conn.eventlist.append(self.refresher)
             logging.info(f"view: Refreshing content every {refresh_interval_s}s"
                          f"{' while hidden' if refresh_when_hidden else ''}")
 
@@ -3221,7 +3033,7 @@ class Wayland_view:
 
     def show_image(self, img_file, fullscreen=False, bg_colour=None):
         self.scale_pip()
-        self.s_objects[0]["text"] = list()
+        self.s_objects[0]["text"] = []
         self.s_objects[0]["file"] = img_file
         rgb = parse_colour(bg_colour) if bg_colour else None
         if rgb:
@@ -3242,7 +3054,7 @@ class Wayland_view:
 
 
 # A refilling token bucket for rate limiting. allow() reports whether a token
-# is available, spend() consumes one -- kept separate so a caller can check
+# is available, spend() consumes one, kept separate so a caller can check
 # several buckets and only commit when all of them permit
 class TokenBucket:
 
@@ -3270,7 +3082,8 @@ class Display:
 
     # The app_ids of the windows we spawn ourselves, the only ones we cycle
     browser_app_ids = ("firefox", "org.servo.Servo", "servoshell", "servo")
-    window_app_ids = ("iss-view", "gst-launch-1.0") + browser_app_ids
+    clock_app_id = "dev.humanbeans.clock"
+    window_app_ids = ("iss-view", "gst-launch-1.0", clock_app_id) + browser_app_ids
     # Every window we cycle gets a workspace to itself, named with this prefix
     workspace_prefix = "iss-"
     # Where the state server binds and where its clients look for it
@@ -3291,10 +3104,10 @@ class Display:
         self.res_y = res_y
         self.started = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
         self.start_time = time.time()
-        self.window_blacklist = list()
+        self.window_blacklist = []
         self.rotation_index = 0
         self.rotation_step = 0
-        # Pinned holds the rotation on the current view; the view keeps
+        # Pinned holds the rotation on the current view. The view keeps
         # refreshing on its own clock, only the automatic advance stops
         self.pinned = False
         self.current_num = None
@@ -3303,17 +3116,15 @@ class Display:
         self.pip_pinned_id = None
         self.pip_paused = False
         self.media_step_gen = 0
-        self.holding = dict()
+        self.holding = {}
         self.command = ""
         self.command_output = ""
         self.hold_outputs = os.environ.get("HOLD_OUTPUTS", "0") == "1"
         self.display_output = os.environ.get("DISPLAY_OUTPUT", "HEADLESS-1")
         self.refresh_hz = int(os.environ.get("DISPLAY_REFRESH_HZ") or 60)
         self.skip_event = threading.Event()
-        self.play_items = dict()
+        self.play_items = {}
         self.playlist = None
-        self.screenshot_path = "/tmp"
-        self.screenshot_file = "screenshot.jpg"
         self.socket_path = self.get_socket_path()
 
         resolution = self.output_resolution()
@@ -3332,31 +3143,20 @@ class Display:
         logging.info(f"Python executable: {sys.executable}")
         logging.info(f"Resolution: {self.res_x} x {self.res_y}")
 
-        # We do not want to handle existing windows,
-        # so we put their IDs on a blacklist
-        # This is usually only useful in development/testing scenarios
-        # e.g. when run locally with an existing sway session
-        existing_windows = []
+        # Windows already up when we start are someone else's, a local sway
+        # session in development, and stay out of the rotation
         try:
-            existing_windows = self.get_windows()
+            self.window_blacklist = [w["id"] for w in self.get_windows()
+                                     if "id" in w]
         except Exception as e:
-            logging.warning(f"display: Failed to get existing windows; sway may be unavailable: {e}")
-            existing_windows = []
-        for win in existing_windows:
-            try:
-                self.window_blacklist.append(win["id"])
-            except Exception:
-                pass
+            logging.warning(f"display: Failed to get existing windows, "
+                            f"sway may be unavailable: {e}")
 
         logging.info(f"Blacklisted {len(self.window_blacklist)} windows")
 
         self.set_window_rules()
 
-    def start_state_server(self, host=None, port=None):
-        if host:
-            self.state_udp_host = host
-        if port:
-            self.state_udp_port = port
+    def start_state_server(self):
         if self._state_server_thread and self._state_server_thread.is_alive():
             logging.info("Display UDP state server already running")
             return True
@@ -3391,26 +3191,24 @@ class Display:
                 'default_play_time_s': (self.playlist.default_play_time_s
                                         if self.playlist else 0)}
 
+    # The reply to one state command, or None for a message that is not one. A
+    # command is a word, optionally followed by its arguments
     def state_reply(self, msg):
-        '''
-        The reply to one state command, or None for a message that is not
-        one. A command is a word, optionally followed by its arguments.
-        '''
         command, _, arg = msg.partition(' ')
         arg = arg.strip()
         fields = arg.split()
 
         queries = {
-            'GET_STATE': lambda: self.state_payload(),
-            'GET_METRICS': lambda: self.metrics_snapshot(),
+            'GET_STATE': self.state_payload,
+            'GET_METRICS': self.metrics_snapshot,
             'GET_PLAYLIST': lambda: {'playlist': self.playlist_items()},
-            'NEXT': lambda: self.step_rotation(1),
-            'PREVIOUS': lambda: self.step_rotation(-1),
-            'pin-view': lambda: self.toggle_view_pin(),
-            'media-play-next': lambda: self.media_step(1),
-            'media-play-previous': lambda: self.media_step(-1),
-            'stop-pip': lambda: self.set_pip(False),
-            'start-pip': lambda: self.set_pip(True),
+            'NEXT': partial(self.step_rotation, 1),
+            'PREVIOUS': partial(self.step_rotation, -1),
+            'pin-view': self.toggle_view_pin,
+            'media-play-next': partial(self.media_step, 1),
+            'media-play-previous': partial(self.media_step, -1),
+            'stop-pip': partial(self.set_pip, False),
+            'start-pip': partial(self.set_pip, True),
         }
         commands = {
             'DEFAULT_TIME': self.set_default_play_time,
@@ -3715,45 +3513,20 @@ class Display:
         return None
 
     def get_socket_path(self):
-        cmd = ['sway', '--get-socketpath']
-        p = subprocess.Popen(cmd,
-                     shell=False,
-                     stdout=subprocess.PIPE,
-                     stderr=subprocess.STDOUT,
-                     encoding="utf8",
-                     env=env)
-
-        out, _ = p.communicate()
-
-        return out.rstrip()
+        return subprocess.run(['sway', '--get-socketpath'], env=env,
+                              capture_output=True, text=True).stdout.rstrip()
 
     @staticmethod
     def swaymsg_send_message(cmd, env=None, log_prefix=None):
-        """
-        Run a swaymsg command via subprocess, log stdout/stderr, and return stdout.
-        Args:
-            cmd (list): Command list for subprocess.
-            env (dict): Environment variables.
-            log_prefix (str): Prefix for log messages.
-        Returns:
-            str: stdout from the command.
-        """
-        p = subprocess.Popen(cmd,
-                            shell=False,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            encoding='utf8',
-                            env=env)
-
-        out, err = p.communicate()
+        done = subprocess.run(cmd, env=env, capture_output=True, text=True)
         prefix = log_prefix or "swaymsg"
-        if out:
-            logging.debug(f"{prefix}: stdout: {out}")
-        if err:
-            logging.warning(f"{prefix}: stderr: {err}")
+        if done.stdout:
+            logging.debug(f"{prefix}: stdout: {done.stdout}")
+        if done.stderr:
+            logging.warning(f"{prefix}: stderr: {done.stderr}")
             metrics.inc("iss_display_swaymsg_errors_total")
 
-        return out
+        return done.stdout
 
     def swaymsg(self, *args, log_prefix="swaymsg"):
         return self.swaymsg_send_message(
@@ -3801,22 +3574,11 @@ class Display:
 
         return windows
 
-    def active_window(self):
-        """Return the active window id or None if unavailable."""
-        try:
-            for node, _ in self.walk_tree(self.sway_tree("active_window")):
-                if node.get('focused') is True and 'id' in node:
-                    return node['id']
-        except Exception as e:
-            logging.debug(f"active_window: failed to determine active window: {e}")
-
-        return None
-
     # Float every window we spawn. Our views set a fixed size and ignore the
     # size the compositor asks them to take, so tiling them, which resizes
     # them to fill their workspace, leaves the buffer and the window disagreeing
     # New windows map onto the focused workspace, which after start-up is the
-    # one a view is showing on -- a slow view (art waits on a museum fetch)
+    # one a view is showing on, a slow view (art waits on a museum fetch)
     # then floats over the live picture until the rotation reaches it. Every
     # window we cycle maps here first instead, off screen, and the rotation
     # moves it out when its turn comes
@@ -3856,9 +3618,12 @@ class Display:
     # which cycles depends on where the double bar was
     pip_workspace = "iss-pip"
 
-    # Tiled, so sway sizes it to fill the workspace
+    # Tiled, so sway sizes it to fill the workspace. Fullscreen is dropped
+    # first: sway draws only a fullscreen window's own transient floaters over
+    # it, so the sticky corner view would vanish behind a fullscreened browser
     def place_pip_full(self, window, previous_id):
         wid = window["id"]
+        self.swaymsg(f"[con_id={wid}]", "fullscreen", "disable", log_prefix="pip")
         self.swaymsg(f"[con_id={wid}]", "floating", "disable", log_prefix="pip")
         self.swaymsg(f"[con_id={wid}]", "border", "none", log_prefix="pip")
         self.swaymsg(f"[con_id={wid}]", "move", "workspace", self.pip_workspace,
@@ -3907,8 +3672,8 @@ class Display:
 
             return []
 
+    # con_id to the output the window sits on
     def window_outputs(self):
-        """Map con_id to the output the window currently sits on."""
         try:
             tree = self.sway_tree("window_outputs")
         except Exception as e:
@@ -3965,7 +3730,19 @@ class Display:
 
     # Views title their window after the playlist item they were spawned for,
     # which is how a window found in the tree is matched back to its item.
-    # The browser titles its own window, so it is matched on app_id instead
+    # The browser titles its own window, so it is matched on app_id instead,
+    # and the engine decides the app_id, so every one it could be maps back
+    def track_item(self, item):
+        if item["player"] == "browser":
+            for key in self.browser_app_ids:
+                self.play_items[key] = item
+        elif item["player"] == "mediaplayer":
+            self.play_items[cmds["media_player"]] = item
+        elif item["player"] == "clock":
+            self.play_items[self.clock_app_id] = item
+        else:
+            self.play_items[f"{item['player']}-{item['num']}"] = item
+
     def set_playlist(self, playlist):
         self.playlist = playlist
         pinned = next((i for i in playlist.playlist
@@ -3977,18 +3754,7 @@ class Display:
             logging.info(f"display: PIP mode, item {self.pip_pinned_num} "
                          f"pinned {where}")
         for item in playlist.playlist:
-            if item["player"] == "browser":
-                # The engine decides the app_id, so every one it could be maps
-                # back to this item
-                for key in self.browser_app_ids:
-                    self.play_items[key] = item
-                continue
-
-            if item["player"] == "mediaplayer":
-                self.play_items[cmds["media_player"]] = item
-                continue
-
-            self.play_items[f"{item['player']}-{item['num']}"] = item
+            self.track_item(item)
 
         logging.info(f"display: Tracking {len(self.play_items)} playlist items")
 
@@ -4125,6 +3891,7 @@ class Display:
         for name in ("iss_display_process_cpu_seconds_total",
                      "iss_display_thread_cpu_seconds_total",
                      "iss_display_process_resident_memory_bytes",
+                     "iss_display_process_resident_memory_peak_bytes",
                      "iss_display_process_threads",
                      "iss_display_processes",
                      "iss_display_process_names_dropped",
@@ -4132,7 +3899,8 @@ class Display:
                      "iss_display_container_memory_bytes"):
             metrics.clear_gauge(name)
 
-        cpu, thread_cpu, rss, threads, counts, names_dropped = process_stats.sample()
+        (cpu, thread_cpu, rss, rss_peak, threads, counts,
+         names_dropped) = process_stats.sample()
         metrics.set("iss_display_process_names_dropped", names_dropped)
         for (process, thread), seconds in thread_cpu.items():
             metrics.set("iss_display_thread_cpu_seconds_total", seconds,
@@ -4140,6 +3908,8 @@ class Display:
 
         for metric, values in (("iss_display_process_cpu_seconds_total", cpu),
                                ("iss_display_process_resident_memory_bytes", rss),
+                               ("iss_display_process_resident_memory_peak_bytes",
+                                rss_peak),
                                ("iss_display_process_threads", threads),
                                ("iss_display_processes", counts)):
             for name, value in values.items():
@@ -4151,6 +3921,8 @@ class Display:
             if value is not None:
                 metrics.set("iss_display_container_memory_bytes", value,
                             state=state)
+        for state, value in ProcessStats.cgroup_memory().items():
+            metrics.set("iss_display_container_memory_bytes", value, state=state)
 
         for metric, source in (("iss_display_container_memory_limit_bytes", "memory.max"),
                                ("iss_display_container_tasks", "pids.current")):
@@ -4252,14 +4024,7 @@ class Display:
         if not item:
             return {"error": f"no player for {uri}"}
 
-        if item["player"] == "browser":
-            for key in self.browser_app_ids:
-                self.play_items[key] = item
-        elif item["player"] == "mediaplayer":
-            self.play_items[cmds["media_player"]] = item
-        else:
-            self.play_items[f"{item['player']}-{item['num']}"] = item
-
+        self.track_item(item)
         logging.info(f"display: Added item {item['num']}: {item['uri']}")
         if item.get("enabled", True):
             self.playlist.start_item(item)
@@ -4400,7 +4165,7 @@ class Display:
         return {"num": num, "bg_colour": target["bg_colour"],
                 "repainted": repainted}
 
-    # The colour is only written here; the redraw itself has to happen on the
+    # The colour is only written here. The redraw itself has to happen on the
     # view's own event loop thread, because everything it touches ends in
     # wayland requests on that thread's connection. So the view is asked to
     # repaint and its select is woken to make it happen now rather than at the
@@ -4507,7 +4272,7 @@ class Display:
             return
 
     # Freeze or resume the rotation on the current view. A manual next/previous
-    # still moves while pinned; only the timed advance is held
+    # still moves while pinned, only the timed advance is held
     def toggle_view_pin(self):
         self.pinned = not self.pinned
         self.skip_event.set()
@@ -4526,7 +4291,7 @@ class Display:
                          self.holding_workspace, log_prefix="pip")
 
     # stop-pip holds the corner window off screen and lets the full slot run as
-    # a plain rotation; start-pip hands the layout back to pip_cycle
+    # a plain rotation. start-pip hands the layout back to pip_cycle
     def set_pip(self, active):
         if self.pip_pinned_num is None:
             return {"error": "no pip in this playlist"}
@@ -4614,8 +4379,7 @@ class Display:
                 focused_id = win_id
 
             shown_from = time.time()
-            self.skip_event.wait(play_time_s)
-            self.skip_event.clear()
+            self.dwell(item.get("num"), play_time_s)
 
             # Pinned: hold here, the view refreshes itself. A manual step
             # (rotation_step set) still gets through
@@ -4631,7 +4395,7 @@ class Display:
             self.rotation_index = (self.rotation_index + step) % len(windows)
 
     # One turn of the pip rotation. The pinned window is placed once, in its
-    # slot; the cycling set takes the other slot, one at a time
+    # slot. The cycling set takes the other slot, one at a time
     def pip_cycle(self, windows, shown_id, t_focus_s):
         place_pinned = (self.place_pip_corner if self.pip_pinned_corner
                         else self.place_pip_full)
@@ -4674,10 +4438,9 @@ class Display:
             shown_id = due["id"]
 
         shown_from = time.time()
-        self.skip_event.wait(play_time_s)
-        self.skip_event.clear()
+        self.dwell(item.get("num"), play_time_s)
 
-        # Pinned: hold on this view; its own refresh timer keeps it current
+        # Pinned: hold on this view, its own refresh timer keeps it current
         if self.pinned and not self.rotation_step:
             return shown_id
 
@@ -4691,27 +4454,35 @@ class Display:
 
         return shown_id
 
+    # The time a view is on screen. A paged view gets the play time per page
+    # and is stepped between pages, then put back on its first page as it
+    # leaves, so the next showing starts at the top. A manual step or a pin
+    # toggle sets skip_event and ends the wait early
+    def dwell(self, num, play_time_s):
+        refresher = content_refresher(num)
+        pager = refresher.pager if refresher else None
+        for page in range(pager.count if pager else 1):
+            self.skip_event.wait(play_time_s)
+            if self.skip_event.is_set():
+                break
+            if pager and page < pager.count - 1:
+                pager.step()
+                refresher.due_now()
+        self.skip_event.clear()
+        if pager and pager.page:
+            pager.page = 0
+            refresher.due_now()
+
     # A view whose content is a carousel gets its next item as it leaves the
     # screen, so each showing is one item and the change is never seen. Views
     # that refresh on their own clock are not registered for this
     @staticmethod
     def advance_item(num):
-        if num is None:
-            return
-
-        with content_refreshers_lock:
-            refresher = content_refreshers.get(str(num))
-
+        refresher = content_refresher(num) if num is not None else None
         if refresher is None or not refresher.refresh_when_hidden:
             return
 
         refresher.due_now()
-
-    def switch_workspace(self, ws):
-        self.swaymsg('workspace', str(ws), log_prefix="switch_workspace")
-
-    def screenshot(self):
-        return screenshot(f"{self.screenshot_path}/{self.screenshot_file}")
 
 default_stream_http_port = 7002
 default_stream_audio_port = 7005
@@ -4726,13 +4497,13 @@ def env_port(name, default):
     except (TypeError, ValueError):
         return default
 
-# scream serves the stream a browser can play; the page needs the port to build
+# scream serves the stream a browser can play. The page needs the port to build
 # its own url, and the controller needs it to fetch a still
 def stream_http_port():
     return env_port("STREAM_HTTP_PORT", default_stream_http_port)
 
 # The media player relays the stream's audio, opus over rtp, to scream on this
-# port; scream mixes it into pay1 and the webm. 0 turns the relay off
+# port. scream mixes it into pay1 and the webm. 0 turns the relay off
 def stream_audio_port():
     return env_port("STREAM_AUDIO_PORT", default_stream_audio_port)
 
@@ -4745,7 +4516,7 @@ def is_loopback_endpoint(endpoint):
 
 # Both scrapes below hit scream on the loopback on a timer. A shared session
 # keeps one connection alive across them instead of opening a fresh socket
-# per call and leaving a TIME_WAIT behind; scream serves /metrics and
+# per call and leaving a TIME_WAIT behind. scream serves /metrics and
 # /snapshot with keep-alive. The connection pool is thread-safe
 _scream_session = requests.Session()
 _scream_session.headers["Connection"] = "keep-alive"
@@ -4776,7 +4547,7 @@ def scream_metrics():
 
     return clients, snapshots_total
 
-# One subscriber per stream type. scream reports its http and rtsp clients; a
+# One subscriber per stream type. scream reports its http and rtsp clients. A
 # vnc viewer holds an established connection to wayvnc's port, minus the
 # controller's own loopback polls
 def stream_subscribers(sockets, scream_clients):
@@ -4813,24 +4584,6 @@ def snapshot_bytes(timeout_s=5):
         logging.error(f"snapshot: Failed to read {snapshot_url()}: {e}")
 
         return None
-
-def screenshot(path=None):
-    if path is None:
-        path = "/tmp/screenshot.jpg"
-    logging.debug(f"Saving screenshot to {path}")
-    data = snapshot_bytes()
-    if data:
-        try:
-            with open(path, "wb") as f:
-                f.write(data)
-
-            return path
-        except OSError as e:
-            logging.error(f"screenshot: Failed to write {path}: {e}")
-
-            return None
-
-    return None
 
 class HtmlPage:
 
@@ -5036,7 +4789,7 @@ table td { padding: 0.5em 2em 0.5em 0.5em; }
         table.append("</table>")
         return "".join(table)
 
-    # vp8 in webm over a chunked response plays natively in <video>;
+    # vp8 in webm over a chunked response plays natively in <video>.
     # hls would have needed hls.js in chrome and firefox, and webrtc a
     # gstreamer plugin alpine does not package
     player_open = """
@@ -5294,15 +5047,43 @@ function useStills(why){
   console.warn("falling back to stills:", why);
   video.hidden = true; still.hidden = false;
   const poll = () => refreshScreenshot().catch(err => console.warn(err));
-  polling = setInterval(poll, 1000);
+  polling = setInterval(poll, 500);
   poll();
 }
+
+const streamBase = location.protocol + "//" + location.hostname + ":" + STREAM_PORT;
+
+// The browser takes the stream it can decode: vp8 in webm plays natively in
+// chrome and firefox, safari plays neither but has hls built in. Stills when
+// the server offers nothing the browser plays
+async function pickSource(){
+  if(video.canPlayType('video/webm; codecs="vp8, opus"')) return streamBase + "/webm";
+  if(video.canPlayType("application/vnd.apple.mpegurl")){
+    const res = await fetch(streamBase + "/hls/stream.m3u8", {cache: "no-store"})
+      .catch(() => null);
+    if(res && res.ok) return streamBase + "/hls/stream.m3u8";
+  }
+  return null;
+}
+
+// A live stream over a plain http response never catches up on its own:
+// every stall the browser rides out stays as delay. Jump back to the live
+// edge when the buffer has run ahead
+function stayLive(){
+  const b = video.buffered;
+  if(b.length && b.end(b.length - 1) - video.currentTime > 2)
+    video.currentTime = b.end(b.length - 1) - 0.5;
+}
+
 video.addEventListener("error", () => useStills("video error"));
 video.crossOrigin = "anonymous";
-video.src = location.protocol + "//" + location.hostname
-            + ":" + STREAM_PORT + "/";
-video.play().catch(e => useStills(e && e.name ? e.name : e));
-setTimeout(() => { if(!video.videoWidth) useStills("no frames"); }, 8000);
+pickSource().then(src => {
+  if(!src){ useStills("no stream this browser plays"); return; }
+  video.src = src;
+  video.play().catch(e => useStills(e && e.name ? e.name : e));
+  setTimeout(() => { if(!video.videoWidth) useStills("no frames"); }, 8000);
+  setInterval(stayLive, 5000);
+});
 </script>
 """
 
@@ -5379,12 +5160,6 @@ if __name__ == "__main__":
                         help="The source of the stream",
                         type=str,
                         default="")
-    parser.add_argument('--stream-source-device',
-                        dest='stream_source_device',
-                        env_var='STREAM_SOURCE_DEVICE',
-                        help="The source device to stream from",
-                        type=str,
-                        default="/dev/video0")
     parser.add_argument('--listen-address',
                         dest='listen_address',
                         env_var='LISTEN_ADDRESS',
@@ -5397,12 +5172,6 @@ if __name__ == "__main__":
                         help="The port to listen on",
                         type=int,
                         default=7000)
-    parser.add_argument('--img-path',
-                        dest='img_path',
-                        env_var='IMAGES_PATH',
-                        help="Path to image files",
-                        type=str,
-                        default="/tmp/screenshots/")
     parser.add_argument('--location',
                         dest='location',
                         env_var='LOCATION',
@@ -5497,7 +5266,6 @@ if __name__ == "__main__":
     if uris_list and isinstance(uris_list[0], str) and "|" in uris_list[0]:
         uris_list = uris_list[0].split("|")
     args.uris = uris_list
-    # Same for MQTT topics: normalize to list, split common separators
     if args.mqtt_topics:
         raw_topics = args.mqtt_topics if isinstance(args.mqtt_topics, list) else [args.mqtt_topics]
         topics_flat = []
@@ -5539,7 +5307,7 @@ if __name__ == "__main__":
     logging.getLogger(__name__).setLevel(level)
 
     # python-wayland logs every registry global, protocol message and draw
-    # call at info -- the xdg/wayland chatter. Keep it for LOGLEVEL=DEBUG only,
+    # call at info, the xdg/wayland chatter. Keep it for LOGLEVEL=DEBUG only,
     # here rather than in the library so it holds whichever build is installed
     logging.getLogger("wayland").setLevel(
         logging.DEBUG if level == logging.DEBUG else logging.WARNING)
@@ -5549,7 +5317,7 @@ if __name__ == "__main__":
     if debug:
         for k, v in env.items():
             logging.debug(f"{k}={v}")
-            logging.debug(System.list_processes())
+        logging.debug("\n".join(render.process_lines(System.process_list())))
 
     if listen_port < 1025 or listen_port > 65535:
         logging.error(f"Invalid port {listen_port}, aborting..")
@@ -5578,8 +5346,6 @@ if __name__ == "__main__":
         logging.warning("vnc: No remote desktop will be available")
 
     display = Display(local_ip, listen_port)
-
-    # Start UDP state server so external processes (e.g., Daphne) can query Display
     display.start_state_server()
 
     nwins = len(display.get_windows())
@@ -5605,7 +5371,6 @@ if __name__ == "__main__":
 
     stream = Stream(stream_source)
 
-    # Publish service on the network via mDNS
     if zeroconf_publish_service:
         zc_listen_address = listen_address
 
@@ -5627,21 +5392,16 @@ if __name__ == "__main__":
                               zc_listen_address,
                               zc_listen_port,
                               zc_service_properties)
-
-        r = zc.register()
-
-        if not r:
-            logging.error("zeroconf: Failed to publish service")
+        zc.register()
 
     web_server = None
     stopping = threading.Event()
     stopping_since = 0.0
     # A normal shutdown (scream, sway, the browser and media player) takes a
-    # few seconds; within this window a second, impatient Ctrl-C is ignored
+    # few seconds. Within this window a second, impatient Ctrl-C is ignored
     # so the graceful path still finishes and exits 0
     force_exit_after_s = 8
 
-    # Set up signal handler
     def signal_handler(number, *args):
         nonlocal_since = time.time() - stopping_since
         if stopping.is_set():
@@ -5657,14 +5417,12 @@ if __name__ == "__main__":
         stopping.set()
         logging.info(f"Signal received: {number}, shutting down")
 
-        # Unpublish service
         if zeroconf_publish_service and zc:
             try:
                 zc.unregister()
             except Exception as e:
                 logging.warning(f"zeroconf: Failed to unregister the service: {e}")
 
-        # Stop UDP state server
         try:
             display.stop_state_server()
         except Exception as e:
@@ -5704,18 +5462,16 @@ if __name__ == "__main__":
 
         os._exit(0)
 
-    # Register signal handler
     for received in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(received, signal_handler)
 
-    # Start ASGI server via uvicorn
     try:
         cmd = [sys.executable, '-m', 'uvicorn', 'controller:app',
                '--host', listen_address, '--port', str(listen_port)]
         if str(loglevel).upper() != 'DEBUG':
             cmd.append('--no-access-log')
         logging.info(f"Starting uvicorn ASGI server on {listen_address}:{listen_port}")
-        # Ensure the controller directory is importable so uvicorn can import 'controller:app'
+        # uvicorn imports controller:app, so the module's directory goes first
         module_dir = os.path.dirname(os.path.abspath(__file__))
         env_mod = os.environ.copy()
         env_mod['PYTHONPATH'] = module_dir + (os.pathsep + env_mod['PYTHONPATH'] if 'PYTHONPATH' in env_mod else '')
