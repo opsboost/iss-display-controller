@@ -1,0 +1,23 @@
+---
+name: Lint
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-lint:
+    name: Lint python
+    uses: bbusse/github-workflows/.github/workflows/run-python-lint.yml@dev
