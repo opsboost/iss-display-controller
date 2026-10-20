@@ -434,6 +434,18 @@ def terminate_process(proc, name, timeout_s=5):
         except subprocess.TimeoutExpired:
             logging.warning(f"{name}: Still running after kill, leaving it to the kernel")
 
+def pid_ancestry(pid, limit=8):
+    chain = []
+    while pid and pid > 1 and len(chain) < limit:
+        chain.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding='utf-8') as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+
+    return chain
+
 # A long-running child with the shared defaults: the controller's environment,
 # closed inherited fds, and its own session so a signal to the controller's
 # process group leaves it alone. Keyword args override each default
@@ -1539,7 +1551,7 @@ class Playlist:
         self.topics = topics or []
 
         self.probe_ip_address = None
-        self.browser = None
+        self.browsers = {}
         self.media_player = None
         # When the media item is an .m3u, its entries and the one playing now,
         # so media_step can move through them
@@ -1830,7 +1842,8 @@ class Playlist:
         "clock":       lambda s, i, p: s.start_clock,
         "dirsizes":    lambda s, i, p: partial(draw_sizes, "dirs"),
         "filesizes":   lambda s, i, p: partial(draw_sizes, "files"),
-        "browser":     lambda s, i, p: partial(s.start_browser, [i["uri"]]),
+        "browser":     lambda s, i, p: partial(s.start_browser, i["num"],
+                                               [i["uri"]]),
         "imageviewer": lambda s, i, p: partial(s.start_image_view, i["uri"]),
         "mediaplayer": lambda s, i, p: partial(s.start_mediaplayer, i["uri"]),
         "date":        lambda s, i, p: partial(s.start_date_view,
@@ -1891,9 +1904,10 @@ class Playlist:
         logging.info(f"Starting {item['player']} view for item {item['num']}")
         x = threading.Thread(target=build(self, item, probe))
         x.playlist_item = item
-        x.start()
-        if not x.is_alive():
-            logging.error(f"Failed to start {item['player']}")
+        try:
+            x.start()
+        except RuntimeError as e:
+            logging.error(f"Failed to start {item['player']}: {e}")
 
             return None
 
@@ -1901,7 +1915,7 @@ class Playlist:
 
         return x
 
-    def start_browser(self, urls, engine=None):
+    def start_browser(self, num, urls, engine=None):
         engine = engine or os.environ.get("BROWSER_ENGINE", "servo")
         if engine not in browser_engines:
             logging.warning(f"Unknown browser engine {engine!r}, using servo")
@@ -1914,9 +1928,11 @@ class Playlist:
 
         # Held on the instance so it can be waited on, restarted and stopped
         # like any other player
-        self.stop_browser()
-        self.browser = spawn(cmd, env=env_mod, encoding='utf8')
-        logging.info(f"Started {engine} as pid {self.browser.pid}: {' '.join(cmd)}")
+        self.stop_browser(num)
+        proc = spawn(cmd, env=env_mod, encoding='utf8')
+        self.browsers[num] = proc
+        logging.info(f"Started {engine} for item {num} as pid {proc.pid}: "
+                     f"{' '.join(cmd)}")
 
         return True
 
@@ -1953,18 +1969,31 @@ class Playlist:
 
         return cmd, env_mod
 
-    def browser_running(self):
-        return self.browser is not None and self.browser.poll() is None
+    def browser_running(self, num=None):
+        if num is None:
+            return any(self.browser_running(n) for n in list(self.browsers))
 
-    def stop_browser(self, timeout_s=5):
-        if not self.browser_running():
-            self.browser = None
+        proc = self.browsers.get(num)
 
+        return proc is not None and proc.poll() is None
+
+    def browser_pids(self):
+        return {proc.pid: num for num, proc in list(self.browsers.items())
+                if proc.poll() is None}
+
+    def stop_browser(self, num=None, timeout_s=5):
+        if num is None:
+            stopped = [self.stop_browser(n, timeout_s)
+                       for n in list(self.browsers)]
+
+            return any(stopped)
+
+        proc = self.browsers.pop(num, None)
+        if proc is None or proc.poll() is not None:
             return False
 
-        logging.info(f"Stopping browser pid {self.browser.pid}")
-        terminate_process(self.browser, "browser", timeout_s)
-        self.browser = None
+        logging.info(f"Stopping browser pid {proc.pid} for item {num}")
+        terminate_process(proc, "browser", timeout_s)
 
         return True
 
@@ -3730,13 +3759,13 @@ class Display:
 
     # Views title their window after the playlist item they were spawned for,
     # which is how a window found in the tree is matched back to its item.
-    # The browser titles its own window, so it is matched on app_id instead,
-    # and the engine decides the app_id, so every one it could be maps back
+    # The browser titles its own window, so it is matched on app_id and the
+    # pid it was spawned as instead, see browser_item
     def track_item(self, item):
         if item["player"] == "browser":
-            for key in self.browser_app_ids:
-                self.play_items[key] = item
-        elif item["player"] == "mediaplayer":
+            return
+
+        if item["player"] == "mediaplayer":
             self.play_items[cmds["media_player"]] = item
         elif item["player"] == "clock":
             self.play_items[self.clock_app_id] = item
@@ -4075,7 +4104,7 @@ class Display:
         stopped = self.stop_view(f"{target['player']}-{target['num']}")
         if target["player"] == "browser":
             try:
-                self.playlist.stop_browser()
+                self.playlist.stop_browser(target["num"])
             except Exception as e:
                 logging.warning(f"display: Failed to stop the browser: {e}")
         elif target["player"] == "mediaplayer":
@@ -4195,9 +4224,28 @@ class Display:
         return False
 
     def window_item(self, window):
+        if window.get("app_id") in self.browser_app_ids:
+            return self.browser_item(window)
+
         for key in (window.get("name"), window.get("app_id")):
             if key in self.play_items:
                 return self.play_items[key]
+
+        return None
+
+    def browser_item(self, window):
+        if not self.playlist:
+            return None
+
+        items = {i["num"]: i for i in self.playlist.playlist
+                 if i["player"] == "browser"}
+        pids = self.playlist.browser_pids()
+        for pid in pid_ancestry(window.get("pid")):
+            if pid in pids:
+                return items.get(pids[pid])
+
+        if len(items) == 1:
+            return next(iter(items.values()))
 
         return None
 
