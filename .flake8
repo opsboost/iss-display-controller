@@ -1,0 +1,26 @@
+# main() injects the parsed args into module globals with
+# globals().update(vars(args)), which pyflakes cannot follow, so every config
+# name would read as F821 undefined without naming them here
+[flake8]
+# One blank line between top level functions is the house style
+extend-ignore = E302, E305
+builtins =
+    apod_api_key,
+    debug,
+    listen_address,
+    listen_port,
+    location,
+    logfile,
+    loglevel,
+    mqtt_broker,
+    mqtt_port,
+    mqtt_pw,
+    mqtt_topics,
+    mqtt_user,
+    probe_ip_address,
+    stream_source,
+    theme_name,
+    uris,
+    zeroconf_publish_service,
+    zeroconf_service_name_prefix,
+    zeroconf_service_type
