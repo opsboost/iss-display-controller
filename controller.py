@@ -2228,12 +2228,13 @@ class Playlist:
             # side across an 8s segment-fetch gap
             big_queue = ["queue", "max-size-buffers=0", "max-size-bytes=0",
                          "max-size-time=8000000000"]
+            decoder = "avdec_h264" if gst_has("avdec_h264") else "openh264dec"
             cmd = [cmds["media_player"], "-q",
                    "curlhttpsrc", f"location={url}", "!",
                    "hlsdemux", "connection-speed=2500", "!",
                    "tsdemux", "name=demux",
                    "demux.", "!", "h264parse", "!", *big_queue, "!",
-                   "openh264dec", "!",
+                   decoder, "!",
                    "videorate", "drop-only=true", "!",
                    "video/x-raw,framerate=25/1", "!",
                    "videoconvert", "!",
