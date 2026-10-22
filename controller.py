@@ -1553,6 +1553,7 @@ class Playlist:
         self.probe_ip_address = None
         self.browsers = {}
         self.media_player = None
+        self.media_url = None
         # When the media item is an .m3u, its entries and the one playing now,
         # so media_step can move through them
         self.media_entries = []
@@ -2000,6 +2001,17 @@ class Playlist:
     def media_player_running(self):
         return self.media_player is not None and self.media_player.poll() is None
 
+    def restart_mediaplayer(self):
+        player = self.media_player
+        if player is None or player.poll() is None:
+            return False
+
+        logging.warning(f"mediaplayer: Exited with {player.returncode}, "
+                        "restarting")
+        self._play_media(self.media_url)
+
+        return True
+
     def stop_mediaplayer(self, timeout_s=5):
         if not self.media_player_running():
             self.media_player = None
@@ -2153,6 +2165,12 @@ class Playlist:
 
         return entries
 
+    def start_entry_index(self):
+        wanted = os.environ.get("MEDIA_START", "ARTE HD").strip().casefold()
+
+        return next((i for i, (name, _) in enumerate(self.media_entries)
+                     if name.casefold() == wanted), 0)
+
     def start_mediaplayer(self, url):
         self.media_entries = []
         self.media_index = 0
@@ -2161,7 +2179,8 @@ class Playlist:
             if not self.media_entries:
                 logging.error("mediaplayer: playlist has no stream entry")
                 return None
-            url = self.media_entries[0][1]
+            self.media_index = self.start_entry_index()
+            url = self.media_entries[self.media_index][1]
 
         return self._play_media(url)
 
@@ -2180,6 +2199,7 @@ class Playlist:
         return {"index": self.media_index, "count": n, "name": name}
 
     def _play_media(self, url):
+        self.media_url = url
         audio_url = None
         if url.endswith(".m3u8"):
             url, audio_url = self.hls_sources(url)
@@ -2193,10 +2213,10 @@ class Playlist:
         # decodebin's multiqueue never fills against the broadcast's
         # wall-clock PTS, so the pipeline hangs in PAUSED. curlhttpsrc keeps
         # libsoup out of the image. connection-speed selects the HLS variant.
-        # Every variant is 50fps, so videorate drops it to 25 ahead of the
-        # convert, scale, compositing and scream re-encode that all run in
-        # software, and drop-only leaves the rate alone when a segment is
-        # short. waylandsink sync=true then paces the 25fps
+        # Every variant is 50fps, so videorate drops it to MEDIA_FRAMERATE (25
+        # by default) ahead of the convert, scale, compositing and scream
+        # re-encode that all run in software, and drop-only leaves the rate
+        # alone when a segment is short. waylandsink sync=true then paces it
         # Audio, where a decoder exists, is opus over RTP to scream on
         # udpsink, sync=true there as well so the packets leave paced to the
         # clock. Without it the 8s queue hands a whole segment to the encoder
@@ -2236,7 +2256,7 @@ class Playlist:
                    "demux.", "!", "h264parse", "!", *big_queue, "!",
                    decoder, "!",
                    "videorate", "drop-only=true", "!",
-                   "video/x-raw,framerate=25/1", "!",
+                   f"video/x-raw,framerate={media_framerate()}/1", "!",
                    "videoconvert", "!",
                    "queue", "max-size-buffers=0", "max-size-bytes=0",
                    "max-size-time=500000000", "!", *sink]
@@ -4291,12 +4311,26 @@ class Display:
 
         result = self.playlist.media_step(direction)
         if isinstance(result, dict) and "error" not in result:
-            self.media_step_gen += 1
-            threading.Thread(target=self._place_stepped_media,
-                             args=(self.media_step_gen, self.pip_pinned_id),
-                             daemon=True).start()
+            self.place_new_media_window()
 
         return result
+
+    def place_new_media_window(self):
+        self.media_step_gen += 1
+        threading.Thread(target=self._place_stepped_media,
+                         args=(self.media_step_gen, self.pip_pinned_id),
+                         daemon=True).start()
+
+    def watch_mediaplayer(self, stopping, interval_s=5):
+        while not stopping.wait(interval_s):
+            try:
+                restarted = self.playlist and self.playlist.restart_mediaplayer()
+            except Exception as e:
+                logging.error(f"mediaplayer: Failed to restart: {e}")
+                continue
+
+            if restarted and self.pip_pinned_num is not None:
+                self.place_new_media_window()
 
     def _place_stepped_media(self, gen, previous_id):
         place = (self.place_pip_corner if self.pip_pinned_corner
@@ -4555,6 +4589,9 @@ def stream_http_port():
 # port. scream mixes it into pay1 and the webm. 0 turns the relay off
 def stream_audio_port():
     return env_port("STREAM_AUDIO_PORT", default_stream_audio_port)
+
+def media_framerate():
+    return max(1, int(os.environ.get("MEDIA_FRAMERATE") or 25))
 
 def is_loopback_endpoint(endpoint):
     host = endpoint.rsplit(":", 1)[0].strip("[]")
@@ -5445,6 +5482,8 @@ if __name__ == "__main__":
 
     web_server = None
     stopping = threading.Event()
+    threading.Thread(target=display.watch_mediaplayer, args=(stopping,),
+                     daemon=True).start()
     stopping_since = 0.0
     # A normal shutdown (scream, sway, the browser and media player) takes a
     # few seconds. Within this window a second, impatient Ctrl-C is ignored
